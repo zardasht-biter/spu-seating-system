@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import api from '../../services/api';
 
 const StudentDashboard = () => {
-  // Safer initialization: Read user from localStorage to prevent blank screen crashes
+  // Safer initialization: Read user from localStorage to prevent crashes during page refreshes
   const [user, setUser] = useState(() => {
     try {
       const saved = localStorage.getItem('user');
@@ -33,7 +33,7 @@ const StudentDashboard = () => {
 
     /** * READ-ONLY LOGIC:
      * If the admin has already set the department and stage (via CSV sync),
-     * we skip the confirmation form even if profile_confirmed is false.
+     * we bypass the setup form even if profile_confirmed is technically false.
      */
     if (user.profile_confirmed || (user.department && user.stage)) {
       fetchMySeats();
@@ -45,10 +45,10 @@ const StudentDashboard = () => {
   const fetchMySeats = async () => {
     try {
       const res = await api.get('/seating/my-seats/');
-      // Ensure we always handle the response as an array
+      // Ensure we always handle the response as an array to prevent .map errors
       setAllocations(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
-      setError('Failed to fetch your assigned seats.');
+      setError('Failed to fetch your assigned exam seats.');
     } finally {
       setLoading(false);
     }
@@ -58,14 +58,13 @@ const StudentDashboard = () => {
     e.preventDefault();
     setUpdatingProfile(true); 
     setError('');
-
     try {
       await api.put('/accounts/profile/update/', { 
         department: department.trim(), 
         stage: parseInt(stage) 
       });
-
-      // Update local state and storage after successful backend update
+      
+      // Update local storage so the dashboard stays in sync without a logout/login
       const updatedUser = { ...user, profile_confirmed: true, department, stage };
       localStorage.setItem('user', JSON.stringify(updatedUser));
       setUser(updatedUser);
@@ -90,14 +89,14 @@ const StudentDashboard = () => {
     );
   }
 
-  // Only show the setup form if the info is completely missing from the admin sync
+  // Determine if student needs to complete their academic profile
   const needsSetup = !user?.profile_confirmed && (!user?.department || !user?.stage);
 
   return (
     <div style={{ backgroundColor: '#f4f6f9', minHeight: '100vh' }}>
       <Navbar bg="primary" variant="dark" className="px-4 shadow-sm mb-4">
         <Navbar.Brand className="fw-bold">SPU Student Portal</Navbar.Brand>
-        <Button variant="outline-light" size="sm" onClick={() => { localStorage.removeItem('user'); navigate('/login'); }}>Logout</Button>
+        <Button variant="outline-light" size="sm" className="fw-bold" onClick={() => { localStorage.removeItem('user'); navigate('/login'); }}>Logout</Button>
       </Navbar>
 
       <Container>
@@ -106,7 +105,7 @@ const StudentDashboard = () => {
         {needsSetup ? (
           <Card className="p-4 shadow-sm mx-auto" style={{ maxWidth: '500px', borderRadius: '15px', border: 'none' }}>
             <h4 className="text-center text-primary fw-bold mb-4">Complete Your Profile</h4>
-            <p className="text-muted small text-center mb-4">Your academic details are missing. Please provide them to see your seat.</p>
+            <p className="text-muted small text-center mb-4">Your academic details are missing. Please provide them to unlock your seating schedule.</p>
             <Form onSubmit={handleProfileSubmit}>
               <Form.Group className="mb-3">
                 <Form.Label className="small fw-bold text-muted">DEPARTMENT</Form.Label>
@@ -125,7 +124,7 @@ const StudentDashboard = () => {
                 </Form.Select>
               </Form.Group>
               <Button variant="primary" type="submit" className="w-100 fw-bold py-2 shadow-sm" disabled={updatingProfile}>
-                {updatingProfile ? <Spinner size="sm" /> : "Confirm Details"}
+                {updatingProfile ? <Spinner size="sm" /> : "Confirm My Details"}
               </Button>
             </Form>
           </Card>
@@ -133,7 +132,6 @@ const StudentDashboard = () => {
           <div>
             <div className="text-center mb-4">
               <h4 className="fw-bold text-dark mb-1">Your Exam Schedule</h4>
-              {/* READ-ONLY Identity Badges */}
               <div className="d-flex justify-content-center gap-2 mt-2">
                 <Badge bg="primary" className="px-3 py-2 shadow-sm text-uppercase">{user.department}</Badge>
                 <Badge bg="dark" className="px-3 py-2 shadow-sm">Stage {user.stage}</Badge>
@@ -150,7 +148,7 @@ const StudentDashboard = () => {
                       <hr className="my-2 opacity-10" />
                       <Row className="mb-3 align-items-center">
                         <Col xs={7}>
-                          <small className="text-muted d-block text-uppercase" style={{ fontSize: '10px' }}>Location / Hall</small>
+                          <small className="text-muted d-block text-uppercase" style={{ fontSize: '10px' }}>Exam Location</small>
                           <div className="fw-bold fs-5 text-dark">{alloc.exam_details.hall_name}</div>
                         </Col>
                         <Col xs={5} className="text-end">
@@ -177,8 +175,8 @@ const StudentDashboard = () => {
               )) : (
                 <Col xs={12}>
                   <Alert variant="info" className="text-center py-5 border-0 shadow-sm bg-white">
-                    <div className="fs-5 mb-2">No seat allocations found.</div>
-                    <div className="small text-muted">Please check back once the administration runs the seating algorithm.</div>
+                    <div className="fs-5 mb-2">No active seat allocations found.</div>
+                    <div className="small text-muted">Check back later once administration runs the seating engine.</div>
                   </Alert>
                 </Col>
               )}
@@ -187,7 +185,7 @@ const StudentDashboard = () => {
         )}
       </Container>
 
-      {/* Hall Map Modal - Exactly matching the Admin Visual Audit Map Style with layout carving */}
+      {/* Hall Map Modal: Synchronized with the Admin Hall Carver Blueprint */}
       <Modal show={showMap} onHide={() => setShowMap(false)} size="lg" centered fullscreen="md-down">
         <Modal.Header closeButton className="bg-dark text-white border-0">
           <Modal.Title className="fw-bold fs-5">Location: {selectedAlloc?.exam_details.hall_name}</Modal.Title>
@@ -204,12 +202,12 @@ const StudentDashboard = () => {
                 const seatingGrid = selectedAlloc.exam_details.seating_grid;
                 const cols = selectedAlloc.exam_details.hall_cols || 5;
                 
-                // Backend sends 1-based index (e.g. Row 1). We need 0-based to match the array index.
+                // Backend sends 1-based index (e.g. Row 1). We convert to 0-based for array mapping.
                 const myR = selectedAlloc.seat_details.row_index - 1;
                 const myC = selectedAlloc.seat_details.col_index - 1;
 
                 if (!seatingGrid || seatingGrid.length === 0) {
-                  return <Alert variant="warning" className="text-center mt-3">Missing seating grid layout data from backend.</Alert>;
+                  return <Alert variant="warning" className="text-center mt-3">Room layout blueprint not found.</Alert>;
                 }
 
                 return (
@@ -271,7 +269,7 @@ const StudentDashboard = () => {
         </Modal.Footer>
       </Modal>
 
-      {/* Synchronized Pulse Animation from HallVisualizer */}
+      {/* Synchronized Pulse Animation Style */}
       <style>{`
         .pulse-highlight {
           animation: pulse-blue 2s infinite;
@@ -282,8 +280,7 @@ const StudentDashboard = () => {
           50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(13, 110, 253, 0); }
           100% { transform: scale(1); }
         }
-        .card { transition: transform 0.2s ease-in-out; }
-        .card:hover { transform: translateY(-3px); }
+        .card:hover { transform: translateY(-3px); transition: transform 0.2s; }
       `}</style>
     </div>
   );

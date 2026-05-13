@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import pymysql
 
 # --- 1. MariaDB/MySQL Stability Bridge ---
-# Required for XAMPP/MariaDB compatibility on Windows
+# Required for XAMPP/MariaDB compatibility on Windows/Termux
 pymysql.version_info = (1, 4, 3, "final", 0) 
 pymysql.install_as_MySQLdb()
 
@@ -111,3 +111,6 @@ EMAIL_USE_TLS = True
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD')
 DEFAULT_FROM_EMAIL = f"SPU Seating System <{EMAIL_HOST_USER}>"
+
+# FIXED: Prevents Gunicorn/Worker timeouts by killing dead SMTP connections after 5 seconds
+EMAIL_TIMEOUT = 5

@@ -11,16 +11,18 @@ from .serializers import ExamSessionSerializer
 # --- 1. HALL MANAGEMENT ---
 
 class HallListView(APIView):
+    """Retrieves all halls and handles new hall creation."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         # VISIBILITY: All admins can view the hall list
         if not request.user.is_staff and not request.user.is_superuser:
             return Response(status=403)
-            
+        
         halls = Hall.objects.all().order_by('name')
         data = []
         for h in halls:
+            # Capacity is derived from the 'seat' tags in the JSON grid
             capacity = sum(row.count('seat') for row in h.seating_grid) if h.seating_grid else 0
             data.append({
                 'id': h.id,
@@ -41,6 +43,7 @@ class HallListView(APIView):
         rows = int(request.data.get('rows', 5))
         cols = int(request.data.get('cols', 5))
         
+        # Initialize a default grid full of seats
         initial_grid = [['seat' for _ in range(cols)] for _ in range(rows)]
         
         hall = Hall.objects.create(
@@ -60,6 +63,7 @@ class HallListView(APIView):
         return Response({'id': hall.id, 'name': hall.name}, status=201)
 
 class HallDetailView(APIView):
+    """Handles deep layout carving and specific hall deletions."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
@@ -95,14 +99,17 @@ class HallDetailView(APIView):
             hall.save()
             
             # Sync layout carving to physical database chairs
+            # We wipe and recreate seats to ensure index integrity
             Seat.objects.filter(hall=hall).delete()
             seats_to_create = []
             for r in range(hall.rows):
                 for c in range(hall.cols):
                     cell_type = grid[r][c]
                     if cell_type == 'seat':
+                        # Active desks the algorithm can use
                         seats_to_create.append(Seat(hall=hall, row_index=r, col_index=c, seat_type='active', is_active=True))
                     elif cell_type == 'path':
+                        # Hallways/Spaces the algorithm must skip
                         seats_to_create.append(Seat(hall=hall, row_index=r, col_index=c, seat_type='space', is_active=False))
             Seat.objects.bulk_create(seats_to_create)
 
@@ -127,10 +134,10 @@ class HallDetailView(APIView):
 # --- 2. EXAM SESSIONS & COHORTS ---
 
 class AvailableCohortsView(APIView):
+    """Calculates the available pool of students and their current seating status."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        # VISIBILITY: Admins can see the pool of available students
         if not request.user.is_staff and not request.user.is_superuser:
             return Response(status=403)
 
@@ -142,6 +149,7 @@ class AvailableCohortsView(APIView):
 
         data = []
         for idx, c in enumerate(cohorts):
+            # Calculate how many students from this cohort are already seated in any session
             seated = Allocation.objects.filter(
                 exam_session__cohorts__department=c['department'],
                 exam_session__cohorts__stage=c['stage'],
@@ -160,10 +168,10 @@ class AvailableCohortsView(APIView):
         return Response(data)
 
 class ExamSessionListView(APIView):
+    """Handles listing and creating new exam room assignments."""
     permission_classes = [permissions.IsAuthenticated]
     
     def get(self, request):
-        # VISIBILITY: Admins can view the session list
         if not request.user.is_staff and not request.user.is_superuser:
             return Response(status=403)
 
@@ -171,7 +179,6 @@ class ExamSessionListView(APIView):
         return Response(ExamSessionSerializer(exams, many=True).data)
 
     def post(self, request):
-        # SECURITY: Only admins with EXAMS permission can create sessions
         if not request.user.has_perm_to('EXAMS'):
             return Response({'error': 'Unauthorized. EXAMS permission required.'}, status=403)
 
@@ -199,7 +206,6 @@ class ExamSessionListView(APIView):
 class ExamSessionDetailView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     def delete(self, request, pk):
-        # SECURITY: Only admins with EXAMS permission can delete sessions
         if not request.user.has_perm_to('EXAMS'):
             return Response({'error': 'Unauthorized. EXAMS permission required.'}, status=403)
 
@@ -213,10 +219,10 @@ class ExamSessionDetailView(APIView):
 # --- 3. ALGORITHM & VISUAL AUDIT ---
 
 class VisualAuditView(APIView):
+    """Provides the data for the high-fidelity admin seating map."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
-        # VISIBILITY: All admins can view the visual seating audit
         if not request.user.is_staff and not request.user.is_superuser:
             return Response(status=403)
 
@@ -225,6 +231,7 @@ class VisualAuditView(APIView):
             seats = Seat.objects.filter(hall=exam.hall).order_by('row_index', 'col_index')
             allocations = Allocation.objects.filter(exam_session=exam).select_related('student', 'seat')
             
+            # Identify students already assigned to sessions in this same time slot
             time_slot_busy_ids = list(Allocation.objects.filter(
                 exam_session__time_range=exam.time_range
             ).values_list('student_id', flat=True))
@@ -241,6 +248,7 @@ class VisualAuditView(APIView):
                     stage__in=exam.cohorts.values_list('stage', flat=True)
                 )
                 
+                # Check for students taking multiple subjects in this room
                 is_retake = matching_enrollments.count() > 1
                 if is_retake:
                     crossovers.append({
@@ -259,6 +267,7 @@ class VisualAuditView(APIView):
                     'is_retake': is_retake
                 })
 
+            # Calculate overflow (students who couldn't fit in the room)
             overflow_data = []
             added_overflow_ids = set() 
             for cohort in exam.cohorts.all():
@@ -284,12 +293,17 @@ class VisualAuditView(APIView):
                         added_overflow_ids.add(u.id)
 
             return Response({
-                'hall_cols': exam.hall.cols, 'seats': seats_data, 'allocations': alloc_data, 'overflow': overflow_data, 'crossovers': crossovers 
+                'hall_cols': exam.hall.cols, 
+                'seats': seats_data, 
+                'allocations': alloc_data, 
+                'overflow': overflow_data, 
+                'crossovers': crossovers 
             })
         except ExamSession.DoesNotExist:
             return Response({'error': 'Session not found'}, status=404)
 
 class RunAllocationView(APIView):
+    """Legacy endpoint placeholder to maintain compatibility with older frontend routes."""
     permission_classes = [permissions.IsAuthenticated]
     def post(self, request): 
         if not request.user.has_perm_to('ALLOCATION'):
@@ -297,6 +311,7 @@ class RunAllocationView(APIView):
         return Response({'message': 'Use algorithm API path.'})
 
 class StudentSeatView(APIView):
+    """Portal for students to see their specific seat assignments and location."""
     permission_classes = [permissions.IsAuthenticated]
     def get(self, request):
         allocations = Allocation.objects.filter(student=request.user).select_related('exam_session', 'seat', 'exam_session__hall')

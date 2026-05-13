@@ -6,8 +6,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
-
-    // UI state for the interactive features
+    // UI state for interactive cohort mapping
     const [colorMap, setColorMap] = useState({});
     const [selectedStudent, setSelectedStudent] = useState(null);
     const [showStudentModal, setShowStudentModal] = useState(false);
@@ -36,7 +35,6 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
             uniqueCohorts.forEach((cohort, idx) => {
                 newColorMap[cohort] = PALETTE[idx % PALETTE.length];
             });
-
             setColorMap(newColorMap);
             setData(fetchedData);
         } catch (err) {
@@ -47,7 +45,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
         }
     };
 
-    // Helper to format departments as requested: IT, DB, NET
+    // Helper to format departments for mobile display (IT, DB, NET)
     const getShortDept = (dept) => {
         if (!dept) return "";
         const d = dept.toUpperCase();
@@ -77,7 +75,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
         <Row className="g-4">
             <Col lg={highlightSeatId ? 12 : 9}>
                 
-                {/* 1. CROSSOVER WARNINGS */}
+                {/* 1. CROSSOVER WARNINGS: Identifies students taking multiple exams simultaneously */}
                 {hasCrossovers && !highlightSeatId && (
                     <Alert variant="warning" className="shadow-sm border-warning fw-bold mb-4">
                         ⚠️ CROSSOVER ALERT: These students are taking multiple subjects in this room:
@@ -94,16 +92,15 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                         FRONT / BOARD AREA
                     </div>
 
-                    {/* SCROLLABLE WRAPPER TO PREVENT SCREEN BREAKING */}
+                    {/* SCROLLABLE WRAPPER TO PREVENT UI BREAKING ON MOBILE */}
                     <div className="overflow-auto pb-2 w-100">
                         <div 
                             style={{ 
                                 display: 'grid', 
-                                // Scaled down minmax to 45px so cells aren't massive on mobile
+                                // Scaled down cells (45px) to ensure higher density on mobile screens
                                 gridTemplateColumns: `repeat(${data.hall_cols || 5}, minmax(45px, 1fr))`,
                                 gap: '6px',
                                 justifyContent: 'center',
-                                // Forces horizontal scroll instead of squishing if the hall is huge
                                 minWidth: 'max-content' 
                             }}
                         >
@@ -125,7 +122,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                                     bgColor = '#0d6efd';
                                     textColor = '#ffffff';
                                 } else if (student) {
-                                    // CRITICAL FIX: Prioritize RED for retakes
+                                    // CRITICAL: Prioritize RED for retakes as per visual guidelines
                                     if (student.is_retake) {
                                         bgColor = '#dc3545';
                                     } else {
@@ -144,7 +141,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                                             ${isMySeat ? 'pulse-highlight' : ''} 
                                             ${student ? 'shadow-sm hover-lift' : ''}`}
                                         style={{ 
-                                            minHeight: '55px', // Reduced from 80px
+                                            minHeight: '55px', 
                                             transition: 'all 0.2s',
                                             backgroundColor: bgColor,
                                             color: textColor,
@@ -155,7 +152,6 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                                     >
                                         {!isSpace && (
                                             <>
-                                                {/* Department Label: Scaled down to 9px for mobile fit */}
                                                 <span className="fw-bold mb-0 mb-md-1" style={{ fontSize: '9px', textTransform: 'uppercase' }}>
                                                     {student ? getShortDept(student.department) : `${seat.row_index + 1}-${seat.col_index + 1}`}
                                                 </span>
@@ -170,7 +166,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                         </div>
                     </div>
 
-                    {/* Legend */}
+                    {/* Legend: Provides a visual guide for cohort colors */}
                     <div className="mt-4 pt-3 border-top d-flex flex-wrap justify-content-center gap-2 small text-muted fw-bold" style={{ fontSize: '11px' }}>
                         {Object.entries(colorMap).map(([cohort, color]) => (
                             <div key={cohort} className="d-flex align-items-center">
@@ -185,7 +181,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                 </Card>
             </Col>
 
-            {/* Waiting List Sidebar */}
+            {/* Waiting List Sidebar: Displays students who could not fit into the room */}
             {!highlightSeatId && (
                 <Col lg={3}>
                     <h6 className="fw-bold mb-3 d-flex justify-content-between align-items-center">
@@ -193,7 +189,8 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                         <Badge bg="danger" pill>{data.overflow?.length || 0}</Badge>
                     </h6>
                     <ListGroup variant="flush" className="shadow-sm rounded border overflow-auto" style={{ maxHeight: '600px' }}>
-                        {data.overflow && data.overflow.length > 0 ? data.overflow.map((student, idx) => (
+                        {data.overflow && data.overflow.length > 0 ?
+                            data.overflow.map((student, idx) => (
                                 <ListGroup.Item key={idx} className="small py-2 bg-light border-bottom">
                                     <div className="d-flex justify-content-between align-items-start mb-1">
                                         <div className="fw-bold text-truncate">{student.email.split('@')[0]}</div>
@@ -213,7 +210,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                 </Col>
             )}
 
-            {/* Student Detail Modal */}
+            {/* Student Detail Modal: Pops up on seat click for granular identification */}
             <Modal show={showStudentModal} onHide={() => setShowStudentModal(false)} centered size="sm">
                 <Modal.Header closeButton style={{ backgroundColor: modalColor, color: 'white', border: 'none' }}>
                     <Modal.Title className="fs-5 fw-bold">Seat {selectedStudent?.seat_label}</Modal.Title>
@@ -227,7 +224,7 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                         </div>
                     )}
                     <div className="text-muted small mb-4">{selectedStudent?.full_email}</div>
-                  
+                    
                     <Row className="g-2 text-start">
                         <Col xs={6}>
                             <div className="p-2 bg-light rounded border small h-100">
@@ -250,8 +247,8 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                     </Row>
                 </Modal.Body>
                 <Modal.Footer className="border-0 justify-content-center pb-4">
-                    <Button variant="outline-secondary" size="sm" onClick={() => setShowStudentModal(false)} className="w-100">
-                        Close Details
+                    <Button variant="outline-secondary" size="sm" onClick={() => setShowStudentModal(false)} className="w-100 fw-bold">
+                        Close Audit
                     </Button>
                 </Modal.Footer>
             </Modal>
@@ -263,7 +260,8 @@ const HallVisualizer = ({ examId, highlightSeatId = null }) => {
                 }
                 @keyframes pulse-blue {
                     0% { transform: scale(1); }
-                    50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(13, 110, 253, 0); }
+                    50% { transform: scale(1.05);
+                         box-shadow: 0 0 0 10px rgba(13, 110, 253, 0); }
                     100% { transform: scale(1); }
                 }
                 .hover-lift:hover {

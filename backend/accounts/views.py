@@ -57,7 +57,8 @@ class RequestOTPView(APIView):
                 f'Your login OTP is: {otp_code}',
                 'noreply@spu.edu.iq', 
                 [email],
-                fail_silently=False,
+                # FIXED: Set to True to prevent SMTP lag from causing WORKER TIMEOUTS
+                fail_silently=True,
             )
         except Exception:
             print(f"SMTP Error. Use OTP from terminal.")
@@ -88,13 +89,12 @@ class VerifyOTPView(APIView):
                 'role': user.role,
                 'profile_confirmed': user.profile_confirmed,
                 'email': user.email,
-                
-                # ADD THESE TWO LINES:
                 'department': user.department,
                 'stage': user.stage
             })
         except User.DoesNotExist:
             return Response({'error': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+
 # --- 2. ROSTER & ENROLLMENT MANAGEMENT ---
 
 class SubjectListView(APIView):
@@ -406,13 +406,13 @@ class StudentSeatView(APIView):
                 'hall_name': a.exam_session.hall.name, 
                 'date': str(a.exam_session.date), 
                 'start_time': a.exam_session.time_range,
-                'hall_rows': a.exam_session.hall.rows,  # NEW
-                'hall_cols': a.exam_session.hall.cols   # NEW
+                'hall_rows': a.exam_session.hall.rows,
+                'hall_cols': a.exam_session.hall.cols,
+                'seating_grid': a.exam_session.hall.seating_grid
             },
             'seat_details': {
                 'row_index': a.seat.row_index + 1 if a.seat else 0, 
                 'col_index': a.seat.col_index + 1 if a.seat else 0
-                # We can safely remove pos_x and pos_y here
             }
         } for a in allocations]
         return Response(data)

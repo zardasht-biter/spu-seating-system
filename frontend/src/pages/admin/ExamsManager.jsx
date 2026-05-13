@@ -14,7 +14,7 @@ const ExamsManager = ({ activeTab }) => {
     });
 
     useEffect(() => { 
-        // Refetch whenever this tab is clicked
+        // Refresh data whenever the user navigates to the Sessions tab
         if (!activeTab || activeTab === 'exams') {
             fetchData(); 
         }
@@ -30,7 +30,7 @@ const ExamsManager = ({ activeTab }) => {
             setExams(examRes.data);
             setHalls(hallRes.data);
             
-            // Sort Alphabetically by Department Name, then Stage
+            // Sort student pools alphabetically by Department, then by Stage for UI clarity
             const sorted = poolRes.data.sort((a, b) => {
                 if (a.department !== b.department) return a.department.localeCompare(b.department);
                 return a.stage - b.stage;
@@ -52,7 +52,7 @@ const ExamsManager = ({ activeTab }) => {
     const handleCreateAssignment = async (e) => {
         e.preventDefault();
         if (selectedPools.length < 1) {
-            alert("Please select at least one cohort.");
+            alert("Please select at least one cohort to map to this room.");
             return;
         }
 
@@ -60,6 +60,7 @@ const ExamsManager = ({ activeTab }) => {
             await api.post('/seating/exams/', {
                 title: `Room Assignment`,
                 hall: assignment.hall,
+                // Combines start and end times into the backend time_range format
                 time_range: `${assignment.startTime} - ${assignment.endTime}`,
                 cohorts: selectedPools.map(p => ({ 
                     department: p.department, 
@@ -68,14 +69,14 @@ const ExamsManager = ({ activeTab }) => {
             });
             alert("Room Map Confirmed!");
             fetchData();
-            setSelectedPools([]);
+            setSelectedPools([]); // Clear selection after successful mapping
         } catch (err) {
             alert("Error: " + JSON.stringify(err.response?.data || "Server Error"));
         }
     };
 
     const handleDeleteExam = async (examId) => {
-        if (window.confirm("Delete this room assignment?")) {
+        if (window.confirm("CRITICAL: Delete this room assignment? All generated seats for this session will be cleared.")) {
             try {
                 await api.delete(`/seating/exams/${examId}/`);
                 fetchData();
@@ -90,8 +91,8 @@ const ExamsManager = ({ activeTab }) => {
             <Col md={5} className="border-end">
                 <Card className="p-4 shadow-sm border-0 bg-light">
                     <h5 className="fw-bold mb-3 text-primary">Room Mapping Tool</h5>
-                    <p className="text-muted small mb-4">Define which groups share this physical space.</p>
-                     
+                    <p className="text-muted small mb-4">Define which groups share this physical space for the upcoming session.</p>
+   
                     <Form.Group className="mb-4">
                         <Form.Label className="fw-bold">1. Select Destination Hall</Form.Label>
                         <Form.Select 
@@ -100,7 +101,11 @@ const ExamsManager = ({ activeTab }) => {
                             required
                         >
                             <option value="">Choose Hall...</option>
-                            {halls.map(h => <option key={h.id} value={h.id}>{h.name} (Cap: {h.capacity})</option>)}
+                            {halls.map(h => (
+                                <option key={h.id} value={h.id}>
+                                    {h.name} (Cap: {h.capacity} Chairs)
+                                </option>
+                            ))}
                         </Form.Select>
                     </Form.Group>
 
@@ -137,6 +142,7 @@ const ExamsManager = ({ activeTab }) => {
                             let bgColor = '#6c757d'; 
                             let textColor = 'white';
 
+                            // Dynamic color mapping for visual feedback on cohort status
                             if (isFull) {
                                 bgColor = isSelected ? '#dc3545' : 'rgba(220, 53, 69, 0.4)';
                             } else if (isWaitlist) {
@@ -168,7 +174,7 @@ const ExamsManager = ({ activeTab }) => {
 
                     <Button 
                         variant="primary" 
-                        className="w-100 fw-bold" 
+                        className="w-100 fw-bold shadow-sm" 
                         onClick={handleCreateAssignment}
                         disabled={selectedPools.length < 1 || !assignment.hall}
                     >
@@ -181,7 +187,12 @@ const ExamsManager = ({ activeTab }) => {
                 <h5 className="fw-bold mb-3 px-2">Active Room Maps</h5>
                 <Table hover responsive className="bg-white rounded shadow-sm border-0">
                     <thead className="bg-light text-uppercase small">
-                        <tr><th>Hall</th><th>Cohorts</th><th>Time Slot</th><th>Action</th></tr>
+                        <tr>
+                            <th>Hall</th>
+                            <th>Cohorts</th>
+                            <th>Time Slot</th>
+                            <th>Action</th>
+                        </tr>
                     </thead>
                     <tbody>
                         {exams.map(e => (

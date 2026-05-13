@@ -10,6 +10,7 @@ const AllocationManager = ({ activeTab }) => {
     const [selectedExamId, setSelectedExamId] = useState(null);
 
     useEffect(() => { 
+        // Automatic refresh when the user switches to this tab
         if (!activeTab || activeTab === 'allocations') {
             fetchData(); 
         }
@@ -27,8 +28,9 @@ const AllocationManager = ({ activeTab }) => {
     const runAllocation = async (examId) => {
         setLoading(examId);
         try {
+            // Triggers the Backend Vertical Staggering Engine
             await api.post(`/algorithm/run/${examId}/`);
-            fetchData();
+            fetchData(); // Refresh table to show updated counts
         } catch (err) { 
             alert(err.response?.data?.error || "Allocation engine error");
         } finally { 
@@ -48,7 +50,7 @@ const AllocationManager = ({ activeTab }) => {
                 <p className="text-muted small">Monitor seat usage and handle overflows from assigned cohorts.</p>
             </div>
 
-            {/* Mobile Optimized: table-responsive added to allow horizontal scrolling on small screens */}
+            {/* Mobile Optimized: table-responsive allows horizontal scrolling on Poco F7/Mobile */}
             <div className="table-responsive">
                 <Table hover className="bg-white shadow-sm rounded border-0">
                     <thead className="bg-light text-uppercase small fw-bold">
@@ -65,6 +67,7 @@ const AllocationManager = ({ activeTab }) => {
                         {exams.map(e => {
                             const hasWaitlist = e.is_allocated && e.waiting_list_count > 0;
                             const hasEmptySeats = e.is_allocated && e.empty_seats > 0;
+                            
                             return (
                                 <tr key={e.id} className="align-middle">
                                     <td>
@@ -91,7 +94,7 @@ const AllocationManager = ({ activeTab }) => {
                                     <td>
                                         {e.cohorts_list?.map((c, i) => (
                                             <Badge key={i} bg="info" className="me-1 mb-1">
-                                                {c.department}-S{c.stage} {c.subject_name}
+                                                {c.department}-S{c.stage}
                                             </Badge>
                                         ))}
                                     </td>
@@ -124,7 +127,7 @@ const AllocationManager = ({ activeTab }) => {
                                             variant={e.is_allocated ? "outline-warning" : "primary"}
                                             onClick={() => runAllocation(e.id)} 
                                             disabled={loading === e.id}
-                                            className="w-100"
+                                            className="w-100 fw-bold"
                                         >
                                             {loading === e.id ? (
                                                 <Spinner size="sm" animation="border" />
@@ -138,7 +141,7 @@ const AllocationManager = ({ activeTab }) => {
                                             <Button 
                                                 size="sm" 
                                                 variant="info" 
-                                                className="text-white w-100" 
+                                                className="text-white w-100 fw-bold" 
                                                 onClick={() => openVisualAudit(e.id)}
                                             >
                                                 View Map
@@ -152,16 +155,16 @@ const AllocationManager = ({ activeTab }) => {
                 </Table>
             </div>
 
-            {/* Mobile Optimized: fullscreen="lg-down" added for better view on Android */}
+            {/* Hall Audit Modal: Uses lg-down fullscreen for high visibility on mobile */}
             <Modal show={showModal} onHide={() => setShowModal(false)} size="xl" centered fullscreen="lg-down">
                 <Modal.Header closeButton className="bg-dark text-white">
-                    <Modal.Title className="fs-6">Seating Audit Map</Modal.Title>
+                    <Modal.Title className="fs-6 fw-bold">Seating Audit Map & Logic Verification</Modal.Title>
                 </Modal.Header>
-                <Modal.Body className="bg-light p-3">
+                <Modal.Body className="bg-light p-0">
                     <HallVisualizer examId={selectedExamId} />
                 </Modal.Body>
-                <Modal.Footer className="border-0">
-                    <Button variant="secondary" onClick={() => setShowModal(false)} className="px-4">
+                <Modal.Footer className="border-top bg-white">
+                    <Button variant="secondary" onClick={() => setShowModal(false)} className="px-4 fw-bold">
                         Close Audit
                     </Button>
                 </Modal.Footer>

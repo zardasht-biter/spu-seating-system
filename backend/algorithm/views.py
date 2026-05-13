@@ -26,10 +26,10 @@ class RunAllocationView(APIView):
             if not assigned_cohorts.exists():
                 return Response({'error': 'Please select at least one cohort for this session.'}, status=400) 
 
-            # 1. Clear previous allocations
+            # 1. Clear previous allocations to allow for re-runs
             Allocation.objects.filter(exam_session=exam).delete()
             
-            # 2. Collision Check: Exclude students busy in other halls
+            # 2. Collision Check: Exclude students already busy in other halls during this time slot
             busy_ids = list(Allocation.objects.filter(
                 exam_session__time_range=exam.time_range
             ).exclude(exam_session=exam).values_list('student_id', flat=True))
@@ -46,7 +46,7 @@ class RunAllocationView(APIView):
                 
                 enrolled_student_ids = [e.student_id for e in enrollments]
 
-                # Filter students (Role check, Busy check, and Duplicate check for crossovers)
+                # Filter students (Role check, Busy check, and Duplicate check for retake crossovers)
                 students = list(User.objects.filter(
                     id__in=enrolled_student_ids, 
                     role='student'
@@ -55,7 +55,7 @@ class RunAllocationView(APIView):
                 queues.append(students)
                 assigned_student_ids.extend([s.id for s in students])
 
-            # 4. Fetch physical chairs (excluding hallways and broken units)
+            # 4. Fetch physical chairs (excluding hallways/paths and broken units)
             active_seats = list(Seat.objects.filter(
                 hall=exam.hall, 
                 seat_type='active', 
@@ -64,33 +64,35 @@ class RunAllocationView(APIView):
 
             allocations = []
             num_cohorts = len(queues)
-         
+       
             # 5. --- TWO-PASS VERTICAL STAGGERING ---
             # Pass 0: Even Rows (Priority spacing: 1 E 1 E 1)
             # Pass 1: Odd Rows (Fill only if cohort still has remaining students)
             for current_pass in [0, 1]:
                 for seat in active_seats:
-                    # Skip if seat already assigned in first pass
+                    # Skip if seat was already assigned in the first pass
                     if any(a.seat_id == seat.id for a in allocations):
                         continue
 
-                    # Column Logic
+                    # Column Logic: Determines which cohort queue belongs in this column
                     if num_cohorts == 1:
+                        # For single cohorts, enforce a strict "Checkerboard" column gap
                         if seat.col_index % 2 != 0:
                             continue 
                         target_q = 0
                     else:
+                        # For multiple cohorts, alternate them by column index
                         target_q = seat.col_index % num_cohorts
 
                     # Vertical Row Staggering Logic
-                    # Pass 0: Only Even Rows (0, 2, 4...)
-                    # Pass 1: Only Odd Rows (1, 3, 5...)
+                    # Pass 0: Fill Only Even Rows (0, 2, 4...) to create spacing
                     if current_pass == 0 and seat.row_index % 2 != 0:
                         continue
+                    # Pass 1: Fill Only Odd Rows (1, 3, 5...) as overflow
                     if current_pass == 1 and seat.row_index % 2 == 0:
                         continue
 
-                    # Seat the student if their specific cohort has people left
+                    # Seat the student if their specific cohort queue has people left
                     if target_q < len(queues) and queues[target_q]:
                         student = queues[target_q].pop(0)
                         allocations.append(Allocation(
@@ -98,9 +100,9 @@ class RunAllocationView(APIView):
                             student=student, 
                             seat=seat
                         ))
-                    # If queues[target_q] is empty, the seat remains empty to protect the pattern
+                    # Note: If queues[target_q] is empty, the seat remains empty to protect the zebra pattern
 
-            # 6. Finalize and Save
+            # 6. Finalize and Save using bulk_create for performance
             Allocation.objects.bulk_create(allocations)
             exam.is_allocated = True
             exam.save()
@@ -108,7 +110,7 @@ class RunAllocationView(APIView):
             total_waiting = sum(len(q) for q in queues)
 
             return Response({
-                'message': 'Allocation complete with Vertical Staggering.',
+                'message': 'Allocation complete with Vertical Staggering (Trio-Zebra Engine).',
                 'allocated_count': len(allocations),
                 'waiting_list_count': total_waiting,
                 'empty_seats': len(active_seats) - len(allocations)

@@ -1,0 +1,53 @@
+$outputFile = "all_code.txt"
+$currentPath = Get-Location
+
+$excludeDirs = @("node_modules", "venv", ".git", "__pycache__", "dist", "build", ".vscode", ".idea", "bin", "obj", "coverage", ".next", ".nuxt")
+$excludeFiles = @("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "requirements.txt", ".env", "all_code.txt", ".gitignore", "Export-Codebase.ps1")
+
+$includeExts = @(".py", ".jsx")
+
+$excludeDirRegex = "(^|[\\/])($($excludeDirs -join '|'))([\\/]|$)"
+
+Write-Host "🚀 Scanning backend & frontend..." -ForegroundColor Cyan
+
+$separator = "=" * 80
+$subSeparator = "-" * 80
+
+$targetDirs = @("backend", "frontend")
+
+# ✅ STEP 1: Collect files safely
+$files = @()
+foreach ($dir in $targetDirs) {
+    if (Test-Path $dir) {
+        $files += Get-ChildItem -Path $dir -File -Recurse
+    }
+}
+
+# ✅ STEP 2: Filter + process
+$allCode = $files | Where-Object {
+    $relativePath = $_.FullName.Substring($currentPath.Path.Length + 1)
+
+    if ($relativePath -match $excludeDirRegex) { return $false }
+    if ($excludeFiles -contains $_.Name) { return $false }
+    if ($includeExts -notcontains $_.Extension.ToLower()) { return $false }
+
+    return $true
+} | ForEach-Object {
+    $relativePath = $_.FullName.Substring($currentPath.Path.Length + 1).Replace('\', '/')
+    $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+
+    if ($null -ne $content) {
+@"
+$separator
+📁 FILE: $relativePath
+$subSeparator
+$content
+
+"@
+    }
+}
+
+$finalOutput = $allCode -join "`n"
+Set-Content -Path $outputFile -Value $finalOutput -NoNewline -Force
+
+Write-Host "✅ Done! Extracted ONLY backend/frontend .py & .jsx → $outputFile" -ForegroundColor Green

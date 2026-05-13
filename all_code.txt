@@ -1,0 +1,3861 @@
+================================================================================
+?? FILE: backend/manage.py
+--------------------------------------------------------------------------------
+import os
+import sys
+import pymysql
+
+# Fix for MariaDB stability on Windows
+pymysql.version_info = (1, 4, 3, "final", 0)
+pymysql.install_as_MySQLdb()
+
+def main():
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
+    try:
+        from django.core.management import execute_from_command_line
+    except ImportError as exc:
+        raise ImportError("Couldn't import Django. Is your venv active?") from exc
+    execute_from_command_line(sys.argv)
+
+if __name__ == '__main__':
+    main()
+
+
+================================================================================
+?? FILE: backend/accounts/admin.py
+--------------------------------------------------------------------------------
+from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin
+from .models import User, SystemSetting, StudentEnrollment
+
+class CustomUserAdmin(UserAdmin):
+    model = User
+    list_display = ['email', 'username', 'role', 'department', 'stage', 'is_staff']
+    fieldsets = UserAdmin.fieldsets + (
+        ('SPU Info', {'fields': ('role', 'stage', 'department', 'profile_confirmed', 'otp')}),
+    )
+
+class StudentEnrollmentAdmin(admin.ModelAdmin):
+    list_display = ['student', 'department', 'stage', 'is_retake']
+    list_filter = ['department', 'stage', 'is_retake']
+    search_fields = ['student__email', 'department']
+
+admin.site.register(User, CustomUserAdmin)
+admin.site.register(SystemSetting)
+admin.site.register(StudentEnrollment, StudentEnrollmentAdmin)
+
+================================================================================
+?? FILE: backend/accounts/models.py
+--------------------------------------------------------------------------------
+from django.db import models
+from django.contrib.auth.models import AbstractUser
+
+class SystemSetting(models.Model):
+    """
+    Global system configurations. 
+    id=1 is reserved for the master setting row.
+    """
+    test_mode_active = models.BooleanField(default=False)
+
+    @classmethod
+    def get_test_mode(cls):
+        # Always fetches the single master setting row
+        setting, _ = cls.objects.get_or_create(id=1)
+        return setting.test_mode_active
+
+class User(AbstractUser):
+    ROLE_CHOICES = (('admin', 'Admin'), ('student', 'Student'))
+    
+    email = models.EmailField(unique=True)
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='student')
+    stage = models.IntegerField(null=True, blank=True)
+    department = models.CharField(max_length=100, null=True, blank=True)
+    
+    # REMOVED: full_name (System is now 100% email-based)
+    
+    profile_confirmed = models.BooleanField(default=False)
+    otp = models.CharField(max_length=6, null=True, blank=True)
+
+    # Granular Permissions: Stores a list of strings (e.g., ['ROSTER', 'HALLS', 'EXAMS'])
+    # Only applicable if the user is an Admin
+    permissions_json = models.JSONField(default=list, blank=True)
+
+    def has_perm_to(self, action):
+        """
+        Helper method to check if an admin has the right to perform a specific action.
+        Master Admins (Superusers) bypass all permission checks.
+        """
+        if self.is_superuser:
+            return True
+        return action in self.permissions_json
+
+    def save(self, *args, **kwargs):
+        # Strict SPU email validation logic
+        # Master Admins and Proctors added by the Master can bypass domain checks
+        if not self.is_staff and not self.is_superuser:
+            test_mode = SystemSetting.get_test_mode()
+            if not test_mode and not self.email.endswith('@spu.edu.iq'):
+                raise ValueError("Only @spu.edu.iq emails are allowed unless Jury Mode is ON.")
+        
+        super().save(*args, **kwargs)
+
+class StudentEnrollment(models.Model):
+    """
+    Links students to a specific department and stage.
+    Tracks cross-stage enrollments via the is_retake flag.
+    """
+    student = models.ForeignKey(User, on_delete=models.CASCADE, related_name='enrollments')
+    department = models.CharField(max_length=100)
+    stage = models.IntegerField()
+    is_retake = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('student', 'department', 'stage')
+
+    def __str__(self):
+        return f"{self.student.email} - {self.department} Stage {self.stage}"
+
+================================================================================
+?? FILE: backend/accounts/urls.py
+--------------------------------------------------------------------------------
+from django.urls import path
+from .views import (
+    RequestOTPView, 
+    VerifyOTPView, 
+    UpdateProfileView,
+    SyncClassroomRosterView, 
+    SubjectListView, 
+    StudentProfileListView,
+    AddManualStudentView, 
+    BulkDeleteStudentsView, 
+    WipeFilteredStudentsView,
+    MasterAdminInfoView, 
+    AdminUserListView, 
+    AdminCreateUserView,
+    UpdatePermissionsView, 
+    GrantMasterStatusView, 
+    DeleteUserView,
+    TestModeToggleView, 
+    ResetStudentProfilesView
+)
+
+urlpatterns = [
+    # --- 1. Authentication & OTP Flow ---
+    path('otp/request/', RequestOTPView.as_view(), name='otp-request'),
+    path('otp/verify/', VerifyOTPView.as_view(), name='otp-verify'),
+    path('profile/update/', UpdateProfileView.as_view(), name='profile-update'),
+
+    # --- 2. Student & Roster Management ---
+    path('profile/sync-roster/', SyncClassroomRosterView.as_view(), name='sync-roster'),
+    path('profile/subjects/', SubjectListView.as_view(), name='subject-list'),
+    path('profile/list/', StudentProfileListView.as_view(), name='student-list-table'),
+    path('profile/add-manual/', AddManualStudentView.as_view(), name='add-manual'),
+    path('profile/bulk-delete/', BulkDeleteStudentsView.as_view(), name='bulk-delete'),
+    path('profile/wipe-filtered/', WipeFilteredStudentsView.as_view(), name='wipe-filtered'),
+    
+    # --- 3. Master Admin Command Center ---
+    # Primary owner identification
+    path('system/master-admin/', MasterAdminInfoView.as_view(), name='master-admin'),
+    
+    # User database oversight
+    path('system/users/', AdminUserListView.as_view(), name='admin-user-list'),
+    
+    # Manual user injection
+    path('system/users/create/', AdminCreateUserView.as_view(), name='admin-create-user'),
+    
+    # Granular permission mapping
+    path('system/users/update-perms/', UpdatePermissionsView.as_view(), name='update-perms'),
+    
+    # Master status promotion
+    path('system/users/make-master/', GrantMasterStatusView.as_view(), name='make-master'),
+    
+    # Account purge/kick logic
+    path('system/users/kick/', DeleteUserView.as_view(), name='kick-user'),
+
+    # --- 4. System Settings & Maintenance ---
+    path('system/test-mode/', TestModeToggleView.as_view(), name='test-mode'),
+    path('profile/reset/', ResetStudentProfilesView.as_view(), name='profile-reset'),
+]
+
+================================================================================
+?? FILE: backend/accounts/views.py
+--------------------------------------------------------------------------------
+import random
+import io
+import csv
+import re
+import pandas as pd
+from datetime import date, time
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, permissions
+from rest_framework.authtoken.models import Token
+from django.core.mail import send_mail
+from django.db import transaction
+from .models import User, SystemSetting, StudentEnrollment
+from seating.models import Allocation
+
+# --- 1. USER PROFILE & AUTHENTICATION ---
+
+class UpdateProfileView(APIView):
+    """Allows students to confirm their SPU identity details."""
+    permission_classes = [permissions.IsAuthenticated]
+    def put(self, request):
+        user = request.user
+        user.department = request.data.get('department', '').strip().upper()
+        user.stage = request.data.get('stage')
+        user.profile_confirmed = True
+        user.save()
+        return Response({'message': 'Profile updated successfully'})
+
+class RequestOTPView(APIView):
+    """Generates login codes with a bypass for Master Admins or Jury Test Mode."""
+    authentication_classes = [] 
+    permission_classes = [permissions.AllowAny]
+    def post(self, request):
+        email = request.data.get('email', '').strip()
+        user_check = User.objects.filter(email=email).first()
+        
+        # Privilege check: Masters and manually authorized proctors bypass domain restrictions
+        is_privileged = user_check and (user_check.is_staff or user_check.is_superuser)
+        test_mode = SystemSetting.get_test_mode()
+
+        if not email.endswith('@spu.edu.iq') and not is_privileged and not test_mode:
+            return Response({'error': 'Strict SPU email required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        otp_code = str(random.randint(100000, 999999))
+        user, _ = User.objects.get_or_create(email=email, defaults={'username': email, 'is_active': False})
+        user.otp = otp_code
+        user.save()
+
+        # Terminal output for local development/demonstration environments
+        print(f"\n=========================================")
+        print(f"🔒 LOGIN OTP FOR {email} IS: {otp_code}")
+        print(f"=========================================\n")
+
+        try:
+            send_mail(
+                'SPU Seating Verification',
+                f'Your login OTP is: {otp_code}',
+                'noreply@spu.edu.iq', 
+                [email],
+                fail_silently=False,
+            )
+        except Exception:
+            print(f"SMTP Error. Use OTP from terminal.")
+
+        return Response({'message': 'OTP generated. Check terminal or email.'})
+
+class VerifyOTPView(APIView):
+    """Validates OTP and synchronizes roles with administrative permissions."""
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+    def post(self, request):
+        email = request.data.get('email')
+        otp = request.data.get('otp')
+        try:
+            user = User.objects.get(email=email, otp=otp)
+            
+            # Sync role if the Master Admin has granted staff or superuser status
+            if user.is_superuser or user.is_staff:
+                user.role = 'admin'
+            
+            user.is_active = True
+            user.otp = None
+            user.save()
+            
+            token, _ = Token.objects.get_or_create(user=user)
+            return Response({
+                'token': token.key,
+                'role': user.role,
+                'profile_confirmed': user.profile_confirmed,
+                'email': user.email,
+                
+                # ADD THESE TWO LINES:
+                'department': user.department,
+                'stage': user.stage
+            })
+        except User.DoesNotExist:
+            return Response({'error': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+# --- 2. ROSTER & ENROLLMENT MANAGEMENT ---
+
+class SubjectListView(APIView):
+    """Deprecated: Kept temporarily to prevent urls.py from breaking during transition."""
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        return Response([])
+
+class StudentProfileListView(APIView):
+    """Populates the Roster table with students enrolled in a selected department and stage."""
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        # VISIBILITY: Allow all staff to view the roster list
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+
+        dept = request.GET.get('department')
+        stage = request.GET.get('stage')
+        
+        if not dept or not stage: return Response([])
+        
+        enrollments = StudentEnrollment.objects.filter(
+            department=dept, stage=stage
+        ).select_related('student')
+        
+        data = [{
+            'id': e.student.id, 
+            'email': e.student.email, 
+            'is_retake': e.is_retake
+        } for e in enrollments]
+        return Response(data)
+    
+class SyncClassroomRosterView(APIView):
+    """Bulk-enrolls students via Smart Regex File Extraction (Email Only) and detects retakes."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Modification requires the ROSTER permission
+        if not request.user.has_perm_to('ROSTER'):
+            return Response({'error': 'Unauthorized. ROSTER permission required.'}, status=403)
+
+        file = request.FILES.get('file')
+        dept = request.data.get('department', '').strip().upper()
+        stage_str = request.data.get('stage')
+        
+        if not file or not stage_str: return Response({'error': 'Missing file or stage.'}, status=400)
+
+        try:
+            stage = int(stage_str)
+            file.seek(0)
+            file_bytes = file.read()
+            rows = []
+
+            # Universal Headerless File Parser
+            if file.name.lower().endswith('.csv'):
+                try:
+                    decoded_file = file_bytes.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    decoded_file = file_bytes.decode('latin1')
+                
+                try:
+                    dialect = csv.Sniffer().sniff(decoded_file[:2048])
+                except Exception:
+                    dialect = csv.excel
+                    
+                reader = csv.reader(io.StringIO(decoded_file), dialect)
+                rows = list(reader)
+                
+            elif file.name.lower().endswith(('.xls', '.xlsx')):
+                df = pd.read_excel(io.BytesIO(file_bytes), header=None)
+                df = df.fillna('')
+                rows = df.values.tolist()
+            else:
+                return Response({'error': 'Please upload a CSV or Excel file.'}, status=400)
+
+            saved_count = 0
+            
+            # Smart Regex Data Extraction (Email Only)
+            for row in rows:
+                row_text = " | ".join([str(c).strip() for c in row if pd.notna(c) and str(c).strip() != ''])
+                
+                # Extract Email using precise Regex
+                email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', row_text)
+                
+                if not email_match:
+                    continue 
+                
+                email = email_match.group(0).lower()
+
+                # 1. Create or get user
+                user, created = User.objects.get_or_create(
+                    email=email, 
+                    defaults={'username': email, 'role': 'student', 'department': dept, 'stage': stage}
+                )
+
+                # 2. Retake Detection
+                existing_stages = StudentEnrollment.objects.filter(student=user, department=dept).exclude(stage=stage).exists()
+                
+                # 3. Save Enrollment
+                enrollment, created_enr = StudentEnrollment.objects.get_or_create(
+                    student=user, 
+                    department=dept,
+                    stage=stage,
+                    defaults={'is_retake': existing_stages}
+                )
+                
+                if existing_stages:
+                    StudentEnrollment.objects.filter(student=user, department=dept).update(is_retake=True)
+
+                saved_count += 1
+            
+            if saved_count == 0:
+                return Response({'error': 'No valid emails found in the file.'}, status=400)
+                
+            return Response({'message': f'Successfully synced {saved_count} students.'})
+        except Exception as e: return Response({'error': str(e)}, status=400)
+
+class AddManualStudentView(APIView):
+    """Injects a single student into the database and enrolls them."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Modification requires the ROSTER permission
+        if not request.user.has_perm_to('ROSTER'):
+            return Response({'error': 'Unauthorized. ROSTER permission required.'}, status=403)
+
+        email = request.data.get('email', '').strip()
+        dept = request.data.get('department', '').strip().upper()
+        stage = request.data.get('stage')
+        
+        user, _ = User.objects.get_or_create(
+            email=email, 
+            defaults={'username': email, 'role': 'student', 'department': dept, 'stage': int(stage)}
+        )
+        
+        existing_stages = StudentEnrollment.objects.filter(student=user, department=dept).exclude(stage=int(stage)).exists()
+            
+        StudentEnrollment.objects.get_or_create(
+            student=user, department=dept, stage=int(stage), defaults={'is_retake': existing_stages}
+        )
+        
+        if existing_stages:
+            StudentEnrollment.objects.filter(student=user, department=dept).update(is_retake=True)
+            
+        return Response({'message': f'{email} added to roster.'})
+
+# --- 3. COMMAND CENTER: MASTER ADMIN & PERMISSIONS ---
+
+class MasterAdminInfoView(APIView):
+    """Identifies the primary system owner based on the initial setup."""
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        master = User.objects.filter(is_superuser=True).order_by('date_joined').first()
+        return Response({
+            'master_email': master.email if master else "None",
+            'is_current_user_master': request.user == master or request.user.is_superuser,
+            'current_user_id': request.user.id
+        })
+
+class AdminUserListView(APIView):
+    """Retrieves all users with their permission maps for the Command Center."""
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        # VISIBILITY: Allow all staff to see the identity list
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+        users = User.objects.all().order_by('-is_superuser', 'email')
+        data = [{
+            'id': u.id, 
+            'email': u.email, 
+            'role': u.role,
+            'is_superuser': u.is_superuser,
+            'permissions_json': u.permissions_json
+        } for u in users]
+        return Response(data)
+
+class AdminCreateUserView(APIView):
+    """Allows Master Admins to manually authorize users from any domain."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Only Master Admin can create other Admin identities
+        if not request.user.is_superuser: 
+            return Response({'error': 'Unauthorized. Master Admin only.'}, status=403)
+
+        email = request.data.get('email', '').strip()
+        role = request.data.get('role', 'admin')
+        if User.objects.filter(email=email).exists(): return Response({'error': 'User already exists.'}, status=400)
+        
+        User.objects.create(email=email, username=email, role=role, is_staff=(role == 'admin'), is_active=True)
+        return Response({'message': f'Successfully authorized {email} as {role.upper()}.'})
+
+class UpdatePermissionsView(APIView):
+    """Syncs granular permission modules to an administrative account."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Only Master Admin can modify privilege maps
+        if not request.user.is_superuser: 
+            return Response({'error': 'Unauthorized. Master Admin only.'}, status=403)
+
+        user = User.objects.get(id=request.data.get('user_id'))
+        user.permissions_json = request.data.get('permissions', [])
+        user.save()
+        return Response({'message': 'Permissions synchronized.'})
+
+class GrantMasterStatusView(APIView):
+    """Promotes an account to Master Admin (Superuser) status."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Only Master Admin can promote others to Master status
+        if not request.user.is_superuser: 
+            return Response({'error': 'Unauthorized. Master Admin only.'}, status=403)
+
+        target = User.objects.get(id=request.data.get('user_id'))
+        target.is_superuser = True
+        target.is_staff = True
+        target.role = 'admin'
+        target.save()
+        return Response({'message': f'Full Master status granted to {target.email}.'})
+
+class DeleteUserView(APIView):
+    """Master Admin tool to purge accounts. Includes safety checks for system ownership."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Only Master Admin can purge identities
+        if not request.user.is_superuser: 
+            return Response({'error': 'Unauthorized. Master Admin only.'}, status=403)
+
+        target = User.objects.get(id=request.data.get('user_id'))
+        
+        # Prevent total system lockout
+        if target.is_superuser and User.objects.filter(is_superuser=True).count() <= 1:
+            return Response({'error': 'Operation denied. Cannot kick the final Master Admin.'}, status=400)
+            
+        target.delete()
+        return Response({'message': 'User successfully purged from the system.'})
+
+# --- 4. SYSTEM SETTINGS & MAINTENANCE ---
+
+class TestModeToggleView(APIView):
+    """Enables Jury Mode to bypass university domain restrictions for demos."""
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request): 
+        # VISIBILITY: Allow all staff to see mode status
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+        return Response({'test_mode_active': SystemSetting.get_test_mode()})
+
+    def post(self, request):
+        # Only admins/staff can toggle the mode
+        if not request.user.is_staff and not request.user.is_superuser: return Response(status=403)
+        setting, _ = SystemSetting.objects.get_or_create(id=1)
+        setting.test_mode_active = not setting.test_mode_active
+        setting.save()
+        return Response({'test_mode_active': setting.test_mode_active})
+
+class ResetStudentProfilesView(APIView):
+    """Executes a full wipe of student academic progress while preserving accounts."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # Only high-level staff/masters can execute academic resets
+        if not request.user.is_staff and not request.user.is_superuser: return Response(status=403)
+        with transaction.atomic():
+            User.objects.filter(role='student').update(profile_confirmed=False, stage=None, department=None)
+            StudentEnrollment.objects.all().delete()
+            Allocation.objects.all().delete()
+        return Response({'message': 'Academic Year Reset complete. Historical seating and enrollments cleared.'})
+
+class BulkDeleteStudentsView(APIView):
+    """Handles standard database cleanup for student accounts."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Deletion requires the ROSTER permission
+        if not request.user.has_perm_to('ROSTER'):
+            return Response({'error': 'Unauthorized. ROSTER permission required.'}, status=403)
+
+        mode = request.data.get('mode')
+        if mode == 'all':
+            User.objects.filter(role='student').delete()
+        elif mode == 'single':
+            User.objects.filter(id=request.data.get('id')).delete()
+        return Response({'message': 'Deletion operation successful.'})
+
+class WipeFilteredStudentsView(APIView):
+    """Surgically removes students based on specific department or stage parameters."""
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        # SECURITY: Deletion requires the ROSTER permission
+        if not request.user.has_perm_to('ROSTER'):
+            return Response({'error': 'Unauthorized. ROSTER permission required.'}, status=403)
+
+        dept = request.data.get('department', '').upper()
+        stage = request.data.get('stage')
+        
+        # Delete enrollments for this stage
+        StudentEnrollment.objects.filter(department=dept, stage=int(stage)).delete()
+        
+        # Clean up orphaned users who have no enrollments left
+        User.objects.filter(role='student', enrollments__isnull=True).delete()
+        
+        return Response({'message': 'Surgical wipe of filtered student data complete.'})
+    
+
+class StudentSeatView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        allocations = Allocation.objects.filter(student=request.user).select_related('exam_session', 'seat', 'exam_session__hall')
+        data = [{
+            'id': a.id,
+            'exam_details': {
+                'title': a.exam_session.title or "Session", 
+                'hall_name': a.exam_session.hall.name, 
+                'date': str(a.exam_session.date), 
+                'start_time': a.exam_session.time_range,
+                'hall_rows': a.exam_session.hall.rows,  # NEW
+                'hall_cols': a.exam_session.hall.cols   # NEW
+            },
+            'seat_details': {
+                'row_index': a.seat.row_index + 1 if a.seat else 0, 
+                'col_index': a.seat.col_index + 1 if a.seat else 0
+                # We can safely remove pos_x and pos_y here
+            }
+        } for a in allocations]
+        return Response(data)
+
+================================================================================
+?? FILE: backend/accounts/migrations/0001_initial.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-21 21:49
+
+import django.contrib.auth.models
+import django.contrib.auth.validators
+from django.db import migrations, models
+import django.utils.timezone
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+        ('auth', '0012_alter_user_first_name_max_length'),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='SystemSetting',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('test_mode_active', models.BooleanField(default=False)),
+            ],
+        ),
+        migrations.CreateModel(
+            name='User',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('password', models.CharField(max_length=128, verbose_name='password')),
+                ('last_login', models.DateTimeField(blank=True, null=True, verbose_name='last login')),
+                ('is_superuser', models.BooleanField(default=False, help_text='Designates that this user has all permissions without explicitly assigning them.', verbose_name='superuser status')),
+                ('username', models.CharField(error_messages={'unique': 'A user with that username already exists.'}, help_text='Required. 150 characters or fewer. Letters, digits and @/./+/-/_ only.', max_length=150, unique=True, validators=[django.contrib.auth.validators.UnicodeUsernameValidator()], verbose_name='username')),
+                ('first_name', models.CharField(blank=True, max_length=150, verbose_name='first name')),
+                ('last_name', models.CharField(blank=True, max_length=150, verbose_name='last name')),
+                ('is_staff', models.BooleanField(default=False, help_text='Designates whether the user can log into this admin site.', verbose_name='staff status')),
+                ('is_active', models.BooleanField(default=True, help_text='Designates whether this user should be treated as active. Unselect this instead of deleting accounts.', verbose_name='active')),
+                ('date_joined', models.DateTimeField(default=django.utils.timezone.now, verbose_name='date joined')),
+                ('email', models.EmailField(max_length=254, unique=True)),
+                ('role', models.CharField(choices=[('admin', 'Admin'), ('student', 'Student')], default='student', max_length=10)),
+                ('stage', models.IntegerField(blank=True, null=True)),
+                ('department', models.CharField(blank=True, max_length=100, null=True)),
+                ('profile_confirmed', models.BooleanField(default=False)),
+                ('otp', models.CharField(blank=True, max_length=6, null=True)),
+                ('groups', models.ManyToManyField(blank=True, help_text='The groups this user belongs to. A user will get all permissions granted to each of their groups.', related_name='user_set', related_query_name='user', to='auth.group', verbose_name='groups')),
+                ('user_permissions', models.ManyToManyField(blank=True, help_text='Specific permissions for this user.', related_name='user_set', related_query_name='user', to='auth.permission', verbose_name='user permissions')),
+            ],
+            options={
+                'verbose_name': 'user',
+                'verbose_name_plural': 'users',
+                'abstract': False,
+            },
+            managers=[
+                ('objects', django.contrib.auth.models.UserManager()),
+            ],
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/accounts/migrations/0002_studentenrollment.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-23 12:19
+
+from django.conf import settings
+from django.db import migrations, models
+import django.db.models.deletion
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('accounts', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='StudentEnrollment',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('department', models.CharField(max_length=100)),
+                ('stage', models.IntegerField()),
+                ('subject_name', models.CharField(max_length=100)),
+                ('student', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='enrollments', to=settings.AUTH_USER_MODEL)),
+            ],
+            options={
+                'unique_together': {('student', 'subject_name')},
+            },
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/accounts/migrations/0003_user_subject_name.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-23 16:03
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('accounts', '0002_studentenrollment'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='user',
+            name='subject_name',
+            field=models.CharField(default='General', max_length=100),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/accounts/migrations/0004_user_permissions_json.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-24 11:31
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('accounts', '0003_user_subject_name'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='user',
+            name='permissions_json',
+            field=models.JSONField(blank=True, default=list),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/accounts/migrations/0005_alter_studentenrollment_unique_together_and_more.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-05-12 14:29
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('accounts', '0004_user_permissions_json'),
+    ]
+
+    operations = [
+        migrations.AlterUniqueTogether(
+            name='studentenrollment',
+            unique_together={('student', 'department', 'stage')},
+        ),
+        migrations.RemoveField(
+            model_name='user',
+            name='subject_name',
+        ),
+        migrations.AddField(
+            model_name='studentenrollment',
+            name='is_retake',
+            field=models.BooleanField(default=False),
+        ),
+        migrations.AddField(
+            model_name='user',
+            name='full_name',
+            field=models.CharField(blank=True, max_length=255, null=True),
+        ),
+        migrations.RemoveField(
+            model_name='studentenrollment',
+            name='subject_name',
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/accounts/migrations/0006_remove_user_full_name.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-05-12 14:58
+
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('accounts', '0005_alter_studentenrollment_unique_together_and_more'),
+    ]
+
+    operations = [
+        migrations.RemoveField(
+            model_name='user',
+            name='full_name',
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/algorithm/urls.py
+--------------------------------------------------------------------------------
+from django.urls import path
+from .views import RunAllocationView
+urlpatterns = [
+    path('run/<int:exam_session_id>/', RunAllocationView.as_view()),
+]
+
+
+================================================================================
+?? FILE: backend/algorithm/views.py
+--------------------------------------------------------------------------------
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import permissions, status
+from seating.models import ExamSession, Seat, Allocation
+from accounts.models import User, StudentEnrollment
+from django.db import models
+
+class RunAllocationView(APIView):
+    """
+    STRICT COLUMN FORMATION ENGINE (v3 - Vertical Staggering).
+    Enforces the exact physical patterns requested:
+    - 1 Cohort: 1 Empty 1 Empty (Strict Vertical Aisles)
+    - 2+ Cohorts: 1 2 1 2 / 1 2 3 1
+    
+    VERTICAL STAGGERING:
+    Implements the "1 E 1 E 1" vertical pattern by prioritizing even rows first.
+    If a cohort runs out, its column remains EMPTY to preserve the formation.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, exam_session_id):
+        try:
+            exam = ExamSession.objects.get(id=exam_session_id)
+            assigned_cohorts = exam.cohorts.all().order_by('id')
+            
+            if not assigned_cohorts.exists():
+                return Response({'error': 'Please select at least one cohort for this session.'}, status=400) 
+
+            # 1. Clear previous allocations
+            Allocation.objects.filter(exam_session=exam).delete()
+            
+            # 2. Collision Check: Exclude students busy in other halls
+            busy_ids = list(Allocation.objects.filter(
+                exam_session__time_range=exam.time_range
+            ).exclude(exam_session=exam).values_list('student_id', flat=True))
+
+            queues = []
+            assigned_student_ids = []
+            
+            # 3. Build student queues for each selected cohort
+            for c in assigned_cohorts:
+                enrollments = StudentEnrollment.objects.filter(
+                    department=c.department, 
+                    stage=c.stage
+                ).select_related('student')
+                
+                enrolled_student_ids = [e.student_id for e in enrollments]
+
+                # Filter students (Role check, Busy check, and Duplicate check for crossovers)
+                students = list(User.objects.filter(
+                    id__in=enrolled_student_ids, 
+                    role='student'
+                ).exclude(id__in=busy_ids).exclude(id__in=assigned_student_ids).order_by('id'))
+                
+                queues.append(students)
+                assigned_student_ids.extend([s.id for s in students])
+
+            # 4. Fetch physical chairs (excluding hallways and broken units)
+            active_seats = list(Seat.objects.filter(
+                hall=exam.hall, 
+                seat_type='active', 
+                is_active=True
+            ).order_by('row_index', 'col_index'))
+
+            allocations = []
+            num_cohorts = len(queues)
+         
+            # 5. --- TWO-PASS VERTICAL STAGGERING ---
+            # Pass 0: Even Rows (Priority spacing: 1 E 1 E 1)
+            # Pass 1: Odd Rows (Fill only if cohort still has remaining students)
+            for current_pass in [0, 1]:
+                for seat in active_seats:
+                    # Skip if seat already assigned in first pass
+                    if any(a.seat_id == seat.id for a in allocations):
+                        continue
+
+                    # Column Logic
+                    if num_cohorts == 1:
+                        if seat.col_index % 2 != 0:
+                            continue 
+                        target_q = 0
+                    else:
+                        target_q = seat.col_index % num_cohorts
+
+                    # Vertical Row Staggering Logic
+                    # Pass 0: Only Even Rows (0, 2, 4...)
+                    # Pass 1: Only Odd Rows (1, 3, 5...)
+                    if current_pass == 0 and seat.row_index % 2 != 0:
+                        continue
+                    if current_pass == 1 and seat.row_index % 2 == 0:
+                        continue
+
+                    # Seat the student if their specific cohort has people left
+                    if target_q < len(queues) and queues[target_q]:
+                        student = queues[target_q].pop(0)
+                        allocations.append(Allocation(
+                            exam_session=exam, 
+                            student=student, 
+                            seat=seat
+                        ))
+                    # If queues[target_q] is empty, the seat remains empty to protect the pattern
+
+            # 6. Finalize and Save
+            Allocation.objects.bulk_create(allocations)
+            exam.is_allocated = True
+            exam.save()
+
+            total_waiting = sum(len(q) for q in queues)
+
+            return Response({
+                'message': 'Allocation complete with Vertical Staggering.',
+                'allocated_count': len(allocations),
+                'waiting_list_count': total_waiting,
+                'empty_seats': len(active_seats) - len(allocations)
+            })
+
+        except ExamSession.DoesNotExist:
+            return Response({'error': 'Exam session not found.'}, status=404)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+================================================================================
+?? FILE: backend/core/asgi.py
+--------------------------------------------------------------------------------
+import os
+from django.core.asgi import get_asgi_application
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
+application = get_asgi_application()
+
+================================================================================
+?? FILE: backend/core/settings.py
+--------------------------------------------------------------------------------
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+import pymysql
+
+# --- 1. MariaDB/MySQL Stability Bridge ---
+# Required for XAMPP/MariaDB compatibility on Windows
+pymysql.version_info = (1, 4, 3, "final", 0) 
+pymysql.install_as_MySQLdb()
+
+load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# --- 2. Security & Environment ---
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-spu-default-key')
+DEBUG = os.environ.get('DEBUG') == 'True'
+ALLOWED_HOSTS = ['*'] # Allows access via local IP during SPU presentation
+
+# --- 3. Application Definition ---
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    'rest_framework',
+    'rest_framework.authtoken',
+    'corsheaders', 
+    'accounts',
+    'seating',
+    'algorithm',
+    'reporting',
+]
+
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware', # Must stay at the top
+    'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'core.urls'
+
+# Fix for admin.E403: Ensures Admin panel templates load correctly
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'core.wsgi.application'
+
+# --- 4. Database (MariaDB/XAMPP Configuration) ---
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': os.environ.get('DB_NAME'),
+        'USER': os.environ.get('DB_USER'),
+        'PASSWORD': os.environ.get('DB_PASSWORD'),
+        'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+        'PORT': os.environ.get('DB_PORT', '3306'),
+        'OPTIONS': {'init_command': "SET sql_mode='STRICT_TRANS_TABLES'"},
+    }
+}
+
+# --- 5. Authentication & Internationalization ---
+AUTH_USER_MODEL = 'accounts.User'
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+TIME_ZONE = 'Asia/Baghdad' # Local SPU Time
+USE_I18N = True
+USE_TZ = True
+
+# --- 6. Static Files ---
+STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# --- 7. Security & API Policies ---
+CORS_ALLOW_ALL_ORIGINS = True # Fixes React-to-Django connection issues
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated', # Defense-ready security
+    ]
+}
+
+# --- 8. SMTP Email (OTP Delivery) ---
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('EMAIL_HOST')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD')
+DEFAULT_FROM_EMAIL = f"SPU Seating System <{EMAIL_HOST_USER}>"
+
+================================================================================
+?? FILE: backend/core/urls.py
+--------------------------------------------------------------------------------
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path('admin/', admin.site.urls), # Standard Django Admin
+    path('api/accounts/', include('accounts.urls')), # OTP & Roster Sync
+    path('api/seating/', include('seating.urls')), # Halls, Exams & Audit
+    path('api/algorithm/', include('algorithm.urls')), # The Seating Engine
+    path('api/reporting/', include('reporting.urls')), # PDF Generation
+]
+
+================================================================================
+?? FILE: backend/core/wsgi.py
+--------------------------------------------------------------------------------
+import os
+from django.core.wsgi import get_wsgi_application
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
+application = get_wsgi_application()
+
+================================================================================
+?? FILE: backend/reporting/urls.py
+--------------------------------------------------------------------------------
+from django.urls import path
+from .views import GenerateSeatCardsView, GenerateAttendanceRosterView, GenerateHallMapView
+
+urlpatterns = [
+    path('cards/<int:exam_session_id>/', GenerateSeatCardsView.as_view()),
+    path('attendance/<int:exam_session_id>/', GenerateAttendanceRosterView.as_view()),
+    path('map/<int:exam_session_id>/', GenerateHallMapView.as_view()),
+]
+
+
+================================================================================
+?? FILE: backend/reporting/views.py
+--------------------------------------------------------------------------------
+from django.http import FileResponse
+from rest_framework.views import APIView
+from seating.models import ExamSession, Allocation
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+import io
+
+class GenerateSeatCardsView(APIView):
+    def get(self, request, exam_session_id):
+        exam = ExamSession.objects.get(id=exam_session_id)
+        allocations = Allocation.objects.filter(exam_session=exam).select_related('student', 'seat')
+        
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=A4)
+        for i, alloc in enumerate(allocations):
+            y = 800 - ((i % 4) * 200)
+            if i > 0 and i % 4 == 0: p.showPage(); y = 800
+            p.rect(50, y-150, 500, 150)
+            p.drawString(70, y-30, f"Student: {alloc.student.email}")
+            p.drawString(70, y-60, f"Exam: {exam.title}")
+            p.drawString(70, y-90, f"Seat: R{alloc.seat.row_index} C{alloc.seat.col_index}")
+        p.save()
+        buffer.seek(0)
+        return FileResponse(buffer, as_attachment=True, filename="seat_cards.pdf")
+
+class GenerateAttendanceRosterView(APIView):
+    def get(self, request, exam_session_id):
+        # Stub for Roster PDF
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=A4)
+        p.drawString(100, 800, "Attendance Roster Placeholder")
+        p.save()
+        buffer.seek(0)
+        return FileResponse(buffer, as_attachment=True, filename="roster.pdf")
+
+class GenerateHallMapView(APIView):
+    def get(self, request, exam_session_id):
+        # Stub for Hall Map PDF
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=A4)
+        p.drawString(100, 800, "Hall Map Placeholder")
+        p.save()
+        buffer.seek(0)
+        return FileResponse(buffer, as_attachment=True, filename="map.pdf")
+
+
+================================================================================
+?? FILE: backend/seating/models.py
+--------------------------------------------------------------------------------
+from django.db import models
+from django.conf import settings
+from django.core.validators import MinValueValidator
+
+class Hall(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    rows = models.IntegerField(validators=[MinValueValidator(1)])
+    cols = models.IntegerField(validators=[MinValueValidator(1)])
+    
+    # Add this line to store the layout carving data
+    seating_grid = models.JSONField(default=list, blank=True) 
+
+    def __str__(self):
+        return f"{self.name} ({self.rows}x{self.cols})"
+
+class Seat(models.Model):
+    """
+    Represents a specific seat within a hall.
+    """
+    hall = models.ForeignKey(Hall, on_delete=models.CASCADE, related_name='seats')
+    row_index = models.IntegerField()
+    col_index = models.IntegerField()
+    
+    # Coordinates are kept for database compatibility but the UI now uses Responsive Grid
+    pos_x = models.FloatField(default=0.0)
+    pos_y = models.FloatField(default=0.0)
+    
+    # Allows marking seats as 'BROKEN' so the algorithm skips them
+    is_active = models.BooleanField(default=True)
+    
+    # NEW: Allows carving out hallways and custom PC layouts ('active', 'broken', 'space')
+    seat_type = models.CharField(max_length=10, default='active') 
+
+    class Meta:
+        unique_together = ('hall', 'row_index', 'col_index')
+
+class ExamSession(models.Model):
+    """
+    Modified: Now acts as a 'Room Map' container.
+    Focuses on Hall and Time Range instead of Exam titles.
+    """
+    # Defaults provided so these aren't required in the Room Mapping UI
+    title = models.CharField(max_length=200, blank=True, null=True, default="Room Mapping")
+    date = models.DateField(auto_now_add=True)
+    
+    # Time Range to define sessions and prevent overlapping assignments
+    time_range = models.CharField(max_length=50, default="9 to 11")
+    
+    hall = models.ForeignKey(Hall, on_delete=models.CASCADE, related_name='exams')
+    is_allocated = models.BooleanField(default=False)
+    retake_students = models.ManyToManyField('accounts.User', blank=True, related_name='retake_exams')
+
+    class Meta:
+        # Prevents creating two identical sessions in the same hall at the same time
+        unique_together = ('hall', 'time_range')
+
+class ExamCohort(models.Model):
+    """
+    Represents the student groups (WHO & WHAT) mapped to a room.
+    """
+    exam_session = models.ForeignKey(ExamSession, on_delete=models.CASCADE, related_name='cohorts')
+    department = models.CharField(max_length=100)
+    stage = models.IntegerField()
+    
+    # FIX: Re-added subject_name so it matches your MySQL database schema and prevents Error 1364
+    subject_name = models.CharField(max_length=100, default='General')
+
+class Allocation(models.Model):
+    """
+    The final record of which student sits in which seat.
+    """
+    exam_session = models.ForeignKey(ExamSession, on_delete=models.CASCADE, related_name='allocations')
+    student = models.ForeignKey('accounts.User', on_delete=models.CASCADE)
+    seat = models.ForeignKey(Seat, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = (('exam_session', 'student'), ('exam_session', 'seat'))
+
+================================================================================
+?? FILE: backend/seating/serializers.py
+--------------------------------------------------------------------------------
+from rest_framework import serializers
+from django.db import models
+from django.db.models import Q
+from .models import Hall, Seat, ExamSession, ExamCohort, Allocation
+from accounts.models import User, StudentEnrollment
+
+class ExamCohortSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamCohort
+        fields = ['department', 'stage', 'subject_name']
+
+class AllocationSerializer(serializers.ModelSerializer):
+    student_email = serializers.CharField(source='student.email', read_only=True)
+    hall_name = serializers.CharField(source='exam_session.hall.name', read_only=True)
+    time_slot = serializers.CharField(source='exam_session.time_range', read_only=True)
+    
+    class Meta:
+        model = Allocation
+        fields = ['id', 'student_email', 'hall_name', 'time_slot', 'seat']
+
+class ExamSessionSerializer(serializers.ModelSerializer):
+    hall_name = serializers.CharField(source='hall.name', read_only=True)
+    cohorts_list = ExamCohortSerializer(source='cohorts', many=True, read_only=True)
+    allocated_count = serializers.SerializerMethodField()
+    waiting_list_count = serializers.SerializerMethodField()
+    empty_seats = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ExamSession
+        fields = [
+            'id', 'title', 'hall', 'hall_name', 
+            'time_range', 'is_allocated', 'cohorts_list',
+            'allocated_count', 'waiting_list_count', 'empty_seats'
+        ]
+
+    def get_allocated_count(self, obj):
+        return obj.allocations.count()
+
+    def get_empty_seats(self, obj):
+        # Calculates truly available chairs by ignoring hallways
+        functional_seats = obj.hall.seats.filter(seat_type='active', is_active=True).count()
+        return functional_seats - obj.allocations.count()
+
+    def get_waiting_list_count(self, obj):
+        """
+        Calculates the real waitlist using exact matching to prevent 
+        crossover students from inflating numbers.
+        """
+        if not obj.is_allocated:
+            return 0
+        
+        busy_ids = Allocation.objects.filter(
+            exam_session__time_range=obj.time_range
+        ).values_list('student_id', flat=True)
+        
+        cohort_q = Q()
+        for c in obj.cohorts.all():
+            # FIX: Removed subject_name from the query since StudentEnrollment no longer has it
+            cohort_q |= Q(department=c.department, stage=c.stage)
+            
+        enrolled_ids = []
+        if cohort_q:
+            enrolled_ids = StudentEnrollment.objects.filter(cohort_q).values_list('student_id', flat=True)
+
+        cohort_students = User.objects.filter(
+            models.Q(id__in=enrolled_ids, role='student') |
+            models.Q(id__in=obj.retake_students.values('id'), role='student')
+        ).distinct()
+        
+        return cohort_students.exclude(id__in=busy_ids).count()
+
+class SeatSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Seat
+        fields = ['id', 'row_index', 'col_index', 'is_active', 'seat_type']
+
+class HallSerializer(serializers.ModelSerializer):
+    capacity = serializers.SerializerMethodField()
+    # FIX: Nested serialization prevents the white screen when clicking 'Manage Seats'
+    seats = SeatSerializer(many=True, read_only=True) 
+
+    class Meta:
+        model = Hall
+        fields = ['id', 'name', 'rows', 'cols', 'capacity', 'seats']
+
+    def get_capacity(self, obj):
+        # Only count actual desks; ignore broken chairs and hallway spaces
+        return obj.seats.filter(seat_type='active', is_active=True).count()
+
+================================================================================
+?? FILE: backend/seating/urls.py
+--------------------------------------------------------------------------------
+from django.urls import path
+from .views import (
+    HallListView,
+    HallDetailView,
+    ExamSessionListView,
+    AvailableCohortsView,
+    RunAllocationView,
+    StudentSeatView,
+    VisualAuditView,
+    ExamSessionDetailView
+)
+
+urlpatterns = [
+    # --- Hall Management & Grid Carver ---
+    path('halls/', HallListView.as_view(), name='hall-list'),
+    path('halls/<int:pk>/', HallDetailView.as_view(), name='hall-detail'),
+
+    # --- Exam Sessions, Cohorts, and Visual Audit ---
+    path('exams/', ExamSessionListView.as_view(), name='exam-list'),
+    path('exams/<int:pk>/', ExamSessionDetailView.as_view(), name='exam-detail'), 
+    path('exams/<int:pk>/visual-audit/', VisualAuditView.as_view(), name='visual-audit'),
+    path('available-cohorts/', AvailableCohortsView.as_view(), name='available-cohorts'),
+
+    # --- The Legacy Allocation Trigger ---
+    path('allocate/', RunAllocationView.as_view(), name='run-allocation'),
+
+    # --- Student Portal Seat Inquiry ---
+    path('my-seats/', StudentSeatView.as_view(), name='student-seat'),
+]
+
+================================================================================
+?? FILE: backend/seating/views.py
+--------------------------------------------------------------------------------
+import json
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, permissions
+from django.db import transaction, IntegrityError
+from django.db.models import Count, Q
+from .models import Hall, ExamSession, Allocation, ExamCohort, Seat
+from accounts.models import User, StudentEnrollment
+from .serializers import ExamSessionSerializer
+
+# --- 1. HALL MANAGEMENT ---
+
+class HallListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        # VISIBILITY: All admins can view the hall list
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+            
+        halls = Hall.objects.all().order_by('name')
+        data = []
+        for h in halls:
+            capacity = sum(row.count('seat') for row in h.seating_grid) if h.seating_grid else 0
+            data.append({
+                'id': h.id,
+                'name': h.name,
+                'rows': h.rows,
+                'cols': h.cols,
+                'capacity': capacity,
+                'seating_grid': h.seating_grid
+            })
+        return Response(data)
+
+    def post(self, request):
+        # SECURITY: Only admins with HALLS permission can create halls
+        if not request.user.has_perm_to('HALLS'):
+            return Response({'error': 'Unauthorized. HALLS permission required.'}, status=403)
+
+        name = request.data.get('name')
+        rows = int(request.data.get('rows', 5))
+        cols = int(request.data.get('cols', 5))
+        
+        initial_grid = [['seat' for _ in range(cols)] for _ in range(rows)]
+        
+        hall = Hall.objects.create(
+            name=name,
+            rows=rows,
+            cols=cols,
+            seating_grid=initial_grid
+        )
+        
+        # Instantly spawn the physical database chairs for the algorithm
+        seats_to_create = []
+        for r in range(rows):
+            for c in range(cols):
+                seats_to_create.append(Seat(hall=hall, row_index=r, col_index=c, seat_type='active', is_active=True))
+        Seat.objects.bulk_create(seats_to_create)
+        
+        return Response({'id': hall.id, 'name': hall.name}, status=201)
+
+class HallDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        # VISIBILITY: All admins can view hall details
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+
+        try:
+            hall = Hall.objects.get(pk=pk)
+            return Response({
+                'id': hall.id,
+                'name': hall.name,
+                'rows': hall.rows,
+                'cols': hall.cols,
+                'seating_grid': hall.seating_grid
+            })
+        except Hall.DoesNotExist:
+            return Response({'error': 'Hall not found'}, status=404)
+
+    def put(self, request, pk):
+        # SECURITY: Only admins with HALLS permission can modify layouts
+        if not request.user.has_perm_to('HALLS'):
+            return Response({'error': 'Unauthorized. HALLS permission required.'}, status=403)
+
+        hall = Hall.objects.get(pk=pk)
+        action = request.data.get('action') 
+
+        if action == 'save_layout':
+            grid = request.data.get('grid')
+            hall.seating_grid = grid
+            hall.rows = request.data.get('rows')
+            hall.cols = request.data.get('cols')
+            hall.save()
+            
+            # Sync layout carving to physical database chairs
+            Seat.objects.filter(hall=hall).delete()
+            seats_to_create = []
+            for r in range(hall.rows):
+                for c in range(hall.cols):
+                    cell_type = grid[r][c]
+                    if cell_type == 'seat':
+                        seats_to_create.append(Seat(hall=hall, row_index=r, col_index=c, seat_type='active', is_active=True))
+                    elif cell_type == 'path':
+                        seats_to_create.append(Seat(hall=hall, row_index=r, col_index=c, seat_type='space', is_active=False))
+            Seat.objects.bulk_create(seats_to_create)
+
+        return Response({
+            'id': hall.id,
+            'name': hall.name,
+            'rows': hall.rows, 
+            'cols': hall.cols, 
+            'seating_grid': hall.seating_grid
+        })
+
+    def delete(self, request, pk):
+        # SECURITY: Only admins with HALLS permission can delete halls
+        if not request.user.has_perm_to('HALLS'):
+            return Response({'error': 'Unauthorized. HALLS permission required.'}, status=403)
+
+        hall = Hall.objects.get(pk=pk)
+        hall.delete()
+        return Response(status=204)
+
+
+# --- 2. EXAM SESSIONS & COHORTS ---
+
+class AvailableCohortsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        # VISIBILITY: Admins can see the pool of available students
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+
+        cohorts = StudentEnrollment.objects.values(
+            'department', 'stage'
+        ).annotate(
+            pool_size=Count('student', distinct=True)
+        ).order_by('department', 'stage')
+
+        data = []
+        for idx, c in enumerate(cohorts):
+            seated = Allocation.objects.filter(
+                exam_session__cohorts__department=c['department'],
+                exam_session__cohorts__stage=c['stage'],
+                student__enrollments__department=c['department'],
+                student__enrollments__stage=c['stage']
+            ).values('student').distinct().count()
+
+            data.append({
+                'id': f"cohort-{idx}",
+                'department': c['department'],
+                'stage': c['stage'],
+                'subject_name': 'General', 
+                'pool_size': c['pool_size'],
+                'seated_count': seated
+            })
+        return Response(data)
+
+class ExamSessionListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        # VISIBILITY: Admins can view the session list
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+
+        exams = ExamSession.objects.all().order_by('-id')
+        return Response(ExamSessionSerializer(exams, many=True).data)
+
+    def post(self, request):
+        # SECURITY: Only admins with EXAMS permission can create sessions
+        if not request.user.has_perm_to('EXAMS'):
+            return Response({'error': 'Unauthorized. EXAMS permission required.'}, status=403)
+
+        data = request.data
+        try:
+            hall = Hall.objects.get(id=data.get('hall'))
+            exam = ExamSession.objects.create(
+                title=data.get('title', 'Room Mapping'),
+                hall=hall,
+                time_range=data.get('time_range')
+            )
+            for c in data.get('cohorts', []):
+                ExamCohort.objects.create(
+                    exam_session=exam, 
+                    department=c.get('department'),
+                    stage=c.get('stage'),
+                    subject_name=c.get('subject_name', 'General')
+                )
+            return Response({'id': exam.id}, status=201)
+        except IntegrityError:
+            return Response({'error': f"Double Booking Prevented! {hall.name} is already booked for this time."}, status=400)
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+
+class ExamSessionDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def delete(self, request, pk):
+        # SECURITY: Only admins with EXAMS permission can delete sessions
+        if not request.user.has_perm_to('EXAMS'):
+            return Response({'error': 'Unauthorized. EXAMS permission required.'}, status=403)
+
+        try:
+            ExamSession.objects.get(pk=pk).delete()
+            return Response({'message': 'Deleted.'}, status=200)
+        except ExamSession.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=404)
+
+
+# --- 3. ALGORITHM & VISUAL AUDIT ---
+
+class VisualAuditView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        # VISIBILITY: All admins can view the visual seating audit
+        if not request.user.is_staff and not request.user.is_superuser:
+            return Response(status=403)
+
+        try:
+            exam = ExamSession.objects.get(id=pk)
+            seats = Seat.objects.filter(hall=exam.hall).order_by('row_index', 'col_index')
+            allocations = Allocation.objects.filter(exam_session=exam).select_related('student', 'seat')
+            
+            time_slot_busy_ids = list(Allocation.objects.filter(
+                exam_session__time_range=exam.time_range
+            ).values_list('student_id', flat=True))
+            
+            seats_data = [{'id': s.id, 'row_index': s.row_index, 'col_index': s.col_index, 'seat_type': s.seat_type, 'is_active': s.is_active} for s in seats]
+
+            alloc_data = []
+            crossovers = []
+            
+            for a in allocations:
+                student = a.student
+                matching_enrollments = student.enrollments.filter(
+                    department__in=exam.cohorts.values_list('department', flat=True),
+                    stage__in=exam.cohorts.values_list('stage', flat=True)
+                )
+                
+                is_retake = matching_enrollments.count() > 1
+                if is_retake:
+                    crossovers.append({
+                        'email': student.email.split('@')[0].upper(),
+                        'subjects': " & ".join([f"Stage {e.stage}" for e in matching_enrollments])
+                    })
+                
+                main_enr = matching_enrollments.first()
+                alloc_data.append({
+                    'seat_id': a.seat.id,
+                    'student_name': student.email.split('@')[0].upper(),
+                    'full_email': student.email,
+                    'department': main_enr.department if main_enr else student.department,
+                    'stage': main_enr.stage if main_enr else student.stage,
+                    'subject': "General",
+                    'is_retake': is_retake
+                })
+
+            overflow_data = []
+            added_overflow_ids = set() 
+            for cohort in exam.cohorts.all():
+                unseated = User.objects.filter(
+                    enrollments__department=cohort.department, enrollments__stage=cohort.stage, 
+                    role='student'
+                ).exclude(id__in=time_slot_busy_ids).distinct()
+                
+                for u in unseated:
+                    if u.id not in added_overflow_ids:
+                        matching_enrs = u.enrollments.filter(
+                            department__in=exam.cohorts.values_list('department', flat=True),
+                            stage__in=exam.cohorts.values_list('stage', flat=True)
+                        )
+                        is_retake = matching_enrs.count() > 1
+                        overflow_data.append({
+                            'email': u.email, 
+                            'department': cohort.department, 
+                            'stage': cohort.stage, 
+                            'subject': 'General',
+                            'is_retake': is_retake 
+                        })
+                        added_overflow_ids.add(u.id)
+
+            return Response({
+                'hall_cols': exam.hall.cols, 'seats': seats_data, 'allocations': alloc_data, 'overflow': overflow_data, 'crossovers': crossovers 
+            })
+        except ExamSession.DoesNotExist:
+            return Response({'error': 'Session not found'}, status=404)
+
+class RunAllocationView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request): 
+        if not request.user.has_perm_to('ALLOCATION'):
+            return Response({'error': 'Unauthorized. ALLOCATION permission required.'}, status=403)
+        return Response({'message': 'Use algorithm API path.'})
+
+class StudentSeatView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        allocations = Allocation.objects.filter(student=request.user).select_related('exam_session', 'seat', 'exam_session__hall')
+        data = [{
+            'id': a.id,
+            'exam_details': {
+                'title': a.exam_session.title or "Session", 
+                'hall_name': a.exam_session.hall.name, 
+                'date': str(a.exam_session.date), 
+                'start_time': a.exam_session.time_range,
+                'hall_rows': a.exam_session.hall.rows,
+                'hall_cols': a.exam_session.hall.cols,
+                'seating_grid': a.exam_session.hall.seating_grid
+            },
+            'seat_details': {
+                'row_index': a.seat.row_index + 1 if a.seat else 0, 
+                'col_index': a.seat.col_index + 1 if a.seat else 0
+            }
+        } for a in allocations]
+        return Response(data)
+
+================================================================================
+?? FILE: backend/seating/migrations/0001_initial.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-21 21:49
+
+from django.conf import settings
+import django.core.validators
+from django.db import migrations, models
+import django.db.models.deletion
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='Hall',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('name', models.CharField(max_length=100, unique=True)),
+                ('rows', models.IntegerField(validators=[django.core.validators.MinValueValidator(1)])),
+                ('cols', models.IntegerField(validators=[django.core.validators.MinValueValidator(1)])),
+            ],
+        ),
+        migrations.CreateModel(
+            name='Seat',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('row_index', models.IntegerField()),
+                ('col_index', models.IntegerField()),
+                ('is_active', models.BooleanField(default=True)),
+                ('hall', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='seats', to='seating.hall')),
+            ],
+            options={
+                'unique_together': {('hall', 'row_index', 'col_index')},
+            },
+        ),
+        migrations.CreateModel(
+            name='ExamSession',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('title', models.CharField(max_length=200)),
+                ('date', models.DateField()),
+                ('start_time', models.TimeField()),
+                ('is_allocated', models.BooleanField(default=False)),
+                ('hall', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='exams', to='seating.hall')),
+                ('retake_students', models.ManyToManyField(blank=True, to=settings.AUTH_USER_MODEL)),
+            ],
+        ),
+        migrations.CreateModel(
+            name='Allocation',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('exam_session', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='allocations', to='seating.examsession')),
+                ('seat', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to='seating.seat')),
+                ('student', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to=settings.AUTH_USER_MODEL)),
+            ],
+            options={
+                'unique_together': {('exam_session', 'seat'), ('exam_session', 'student')},
+            },
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0002_alter_examsession_retake_students_examcohort.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-22 11:33
+
+from django.conf import settings
+from django.db import migrations, models
+import django.db.models.deletion
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+        ('seating', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='examsession',
+            name='retake_students',
+            field=models.ManyToManyField(blank=True, related_name='retake_exams', to=settings.AUTH_USER_MODEL),
+        ),
+        migrations.CreateModel(
+            name='ExamCohort',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('department', models.CharField(max_length=100)),
+                ('stage', models.IntegerField()),
+                ('exam_session', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='cohorts', to='seating.examsession')),
+            ],
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0003_examcohort_subject_name.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-23 12:19
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('seating', '0002_alter_examsession_retake_students_examcohort'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='examcohort',
+            name='subject_name',
+            field=models.CharField(default='General', max_length=100),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0004_seat_pos_x_seat_pos_y_alter_examsession_date_and_more.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-23 15:03
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('seating', '0003_examcohort_subject_name'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='seat',
+            name='pos_x',
+            field=models.FloatField(default=0.0),
+        ),
+        migrations.AddField(
+            model_name='seat',
+            name='pos_y',
+            field=models.FloatField(default=0.0),
+        ),
+        migrations.AlterField(
+            model_name='examsession',
+            name='date',
+            field=models.DateField(auto_now_add=True),
+        ),
+        migrations.AlterField(
+            model_name='examsession',
+            name='start_time',
+            field=models.TimeField(default='09:00'),
+        ),
+        migrations.AlterField(
+            model_name='examsession',
+            name='title',
+            field=models.CharField(blank=True, max_length=200, null=True),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0005_examsession_time_range_alter_examsession_title_and_more.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-23 16:17
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('seating', '0004_seat_pos_x_seat_pos_y_alter_examsession_date_and_more'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='examsession',
+            name='time_range',
+            field=models.CharField(default='9 to 11', max_length=50),
+        ),
+        migrations.AlterField(
+            model_name='examsession',
+            name='title',
+            field=models.CharField(blank=True, default='Room Mapping', max_length=200, null=True),
+        ),
+        migrations.AlterUniqueTogether(
+            name='examsession',
+            unique_together={('hall', 'time_range')},
+        ),
+        migrations.RemoveField(
+            model_name='examsession',
+            name='start_time',
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0006_seat_seat_type.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-24 09:45
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('seating', '0005_examsession_time_range_alter_examsession_title_and_more'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='seat',
+            name='seat_type',
+            field=models.CharField(default='active', max_length=10),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: backend/seating/migrations/0007_hall_seating_grid.py
+--------------------------------------------------------------------------------
+# Generated by Django 4.2.11 on 2026-04-24 11:59
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('seating', '0006_seat_seat_type'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='hall',
+            name='seating_grid',
+            field=models.JSONField(blank=True, default=list),
+        ),
+    ]
+
+
+================================================================================
+?? FILE: frontend/src/App.jsx
+--------------------------------------------------------------------------------
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import 'bootstrap/dist/css/bootstrap.min.css';
+
+// Core Pages
+import Login from './pages/Login';
+import StudentDashboard from './pages/student/StudentDashboard';
+import AdminDashboard from './pages/admin/AdminDashboard';
+
+function App() {
+  return (
+    <>
+      {/* Mobile Optimization Styles for Admin Navigation */}
+      <style>{`
+        @media (max-width: 768px) {
+          .nav-tabs {
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            overflow-x: auto !important;
+            overflow-y: hidden;
+            -webkit-overflow-scrolling: touch;
+            border-bottom: none;
+          }
+          .nav-tabs .nav-item {
+            white-space: nowrap;
+          }
+          .table-responsive {
+            border: 0 !important;
+          }
+        }
+      `}</style>
+
+      <Router>
+        <Routes>
+          {/* Login Page */}
+          <Route path="/login" element={<Login />} />
+          
+          {/* The Main Admin Dashboard (This contains all 5 tabs) */}
+          <Route path="/admin" element={<AdminDashboard />} />
+
+          {/* Student Portal */}
+          <Route path="/student" element={<StudentDashboard />} />
+
+          {/* Default Redirect & Catch-all for broken paths like /profile-setup */}
+          <Route path="/" element={<Navigate to="/login" replace />} />
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
+      </Router>
+    </>
+  );
+}
+
+export default App;
+
+================================================================================
+?? FILE: frontend/src/main.jsx
+--------------------------------------------------------------------------------
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import 'bootstrap/dist/css/bootstrap.min.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
+
+================================================================================
+?? FILE: frontend/src/pages/Login.jsx
+--------------------------------------------------------------------------------
+import { useState } from 'react';
+import { Container, Form, Button, Card, Alert, Spinner, InputGroup } from 'react-bootstrap';
+import { useNavigate } from 'react-router-dom';
+import api from '../services/api';
+
+const Login = () => {
+  const [email, setEmail] = useState('');
+  const [otp, setOtp] = useState('');
+  const [step, setStep] = useState(1); // 1: Email Input, 2: OTP Input
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+
+  // Step 1: Request the 6-digit code
+  const handleRequestOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      await api.post('/accounts/otp/request/', { email });
+      setStep(2);
+    } catch (err) {
+      setError(err.response?.data?.error || 'Access denied. Please use an authorized SPU email.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Step 2: Verify the code and establish the session
+  const handleVerifyOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      const res = await api.post('/accounts/otp/verify/', { email, otp });
+      
+      // Store the token and user info in local storage
+      localStorage.setItem('user', JSON.stringify(res.data));
+      
+      // FIXED: Redirect based on the role assigned by the Master Admin
+      if (res.data.role === 'admin') {
+        navigate('/admin');
+      } else {
+        // Students are sent directly to /student; the dashboard handles the setup form
+        navigate('/student');
+      }
+    } catch (err) {
+      setError('Invalid or expired code. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Container className="d-flex align-items-center justify-content-center" style={{ minHeight: '100vh', backgroundColor: '#f0f2f5' }}>
+      <Card className="shadow-lg border-0 p-4" style={{ width: '100%', maxWidth: '420px', borderRadius: '15px' }}>
+        <Card.Body>
+          <div className="text-center mb-4">
+            <div className="bg-primary text-white d-inline-block p-3 rounded-circle mb-3 shadow">
+              <span className="fw-bold fs-4">SPU</span>
+            </div>
+            <h3 className="fw-bold text-dark">Exam Portal</h3>
+            <p className="text-muted small">Technical College of Informatics</p>
+          </div>
+
+          {error && <Alert variant="danger" className="py-2 small text-center">{error}</Alert>}
+
+          {step === 1 ? (
+            <Form onSubmit={handleRequestOTP}>
+              <Form.Group className="mb-4">
+                <Form.Label className="small fw-bold text-muted">UNIVERSITY EMAIL</Form.Label>
+                <Form.Control 
+                  type="email" 
+                  placeholder="name@spu.edu.iq" 
+                  className="py-2"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                />
+                <Form.Text className="text-muted" style={{ fontSize: '0.75rem' }}>
+                  A one-time verification code will be sent to this address.
+                </Form.Text>
+              </Form.Group>
+              <Button variant="primary" type="submit" className="w-100 fw-bold py-2 shadow-sm" disabled={loading}>
+                {loading ? <Spinner size="sm" animation="border" /> : "Send Access Code"}
+              </Button>
+            </Form>
+          ) : (
+            <Form onSubmit={handleVerifyOTP}>
+              <Form.Group className="mb-4 text-center">
+                <Form.Label className="small fw-bold text-success mb-3 d-block">CODE SENT TO {email}</Form.Label>
+                <div className="d-flex justify-content-center">
+                  <Form.Control 
+                    type="text" 
+                    placeholder="000000" 
+                    maxLength="6"
+                    className="text-center fs-3 fw-bold tracking-widest"
+                    style={{ letterSpacing: '10px', width: '220px', border: '2px solid #198754' }}
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value)}
+                    autoFocus
+                    required
+                  />
+                </div>
+              </Form.Group>
+              <Button variant="success" type="submit" className="w-100 fw-bold py-2 shadow-sm" disabled={loading}>
+                {loading ? <Spinner size="sm" animation="border" /> : "Verify & Sign In"}
+              </Button>
+              <div className="text-center mt-3">
+                <Button 
+                  variant="link" 
+                  className="text-decoration-none text-muted small" 
+                  onClick={() => setStep(1)}
+                >
+                  Change Email Address
+                </Button>
+              </div>
+            </Form>
+          )}
+        </Card.Body>
+      </Card>
+    </Container>
+  );
+};
+
+export default Login;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/AdminDashboard.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Container, Tab, Tabs, Button, Navbar, Form, Table, Badge, ButtonGroup, Alert, Row, Col, Card, Spinner, Modal } from 'react-bootstrap';
+import { useNavigate } from 'react-router-dom';
+import api from '../../services/api';
+
+// Importing SPU Project Tab Managers
+import RosterManager from './RosterManager';
+import HallsManager from './HallsManager';
+import ExamsManager from './ExamsManager';
+import AllocationManager from './AllocationManager';
+
+const AdminDashboard = () => {
+  const [key, setKey] = useState('roster');
+  const [testMode, setTestMode] = useState(false);
+  const [masterInfo, setMasterInfo] = useState({ master_email: '', is_current_user_master: false, current_user_id: null });
+  const [allUsers, setAllUsers] = useState([]);
+
+  // Permission Modal State
+  const [showPermsModal, setShowPermsModal] = useState(false);
+  const [targetUser, setTargetUser] = useState(null);
+  const [selectedPerms, setSelectedPerms] = useState([]);
+
+  // Form & Loading States
+  const [newUser, setNewUser] = useState({ email: '', role: 'admin' });
+  const [actionLoading, setActionLoading] = useState(false);
+  const [systemLoading, setSystemLoading] = useState(true);
+  
+  const navigate = useNavigate();
+
+  // Mapping to Backend Permission JSON logic
+  const PERMISSION_KEYS = [
+    { key: 'ROSTER', label: '1. Roster Sync & Student Database' },
+    { key: 'HALLS', label: '2. Hall Layouts & Grid Carving' },
+    { key: 'EXAMS', label: '3. Exam Session Mapping' },
+    { key: 'ALLOCATION', label: '4. Seating Algorithm (Trio-Zebra)' },
+    { key: 'REPORTS', label: '5. PDF Generation (Seat Cards & Lists)' }
+  ];
+
+  useEffect(() => {
+    fetchSystemData();
+  }, []);
+
+  const fetchSystemData = async () => {
+    setSystemLoading(true);
+    try {
+      const [testRes, masterRes, usersRes] = await Promise.all([
+        api.get('/accounts/system/test-mode/'),
+        api.get('/accounts/system/master-admin/'),
+        api.get('/accounts/system/users/')
+      ]);
+      setTestMode(testRes.data.test_mode_active);
+      setMasterInfo(masterRes.data);
+      setAllUsers(usersRes.data);
+    } catch (err) {
+      console.error("System Data Load Error:", err);
+    } finally {
+      setSystemLoading(false);
+    }
+  };
+
+  const handleAddUser = async (e) => {
+    e.preventDefault();
+    setActionLoading(true);
+    try {
+      const res = await api.post('/accounts/system/users/create/', newUser);
+      alert(res.data.message);
+      setNewUser({ email: '', role: 'admin' });
+      fetchSystemData();
+    } catch (err) {
+      alert(err.response?.data?.error || "Failed to add user.");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleKick = async (userId) => {
+    if (window.confirm("CRITICAL SECURITY ACTION: Purge this user? All system access will be revoked immediately.")) {
+        try {
+            await api.post('/accounts/system/users/kick/', { user_id: userId });
+            fetchSystemData();
+        } catch (err) { alert(err.response?.data?.error || "Purge operation failed."); }
+    }
+  };
+
+  const handleMakeMaster = async (userId) => {
+    const msg = "SECURITY WARNING: You are granting FULL MASTER STATUS. This user will have the power to delete you. Proceed?";
+    if (window.confirm(msg)) {
+        try {
+            await api.post('/accounts/system/users/make-master/', { user_id: userId });
+            fetchSystemData();
+        } catch (err) { alert(err.response?.data?.error || "Promotion failed."); }
+    }
+  };
+
+  const savePermissions = async () => {
+    try {
+        await api.post('/accounts/system/users/update-perms/', { 
+            user_id: targetUser.id, 
+            permissions: selectedPerms 
+        });
+        setShowPermsModal(false);
+        fetchSystemData();
+        alert("Permissions updated.");
+    } catch (err) { alert("Failed to sync permissions."); }
+  };
+
+  const toggleTestMode = async () => {
+    try {
+      const res = await api.post('/accounts/system/test-mode/');
+      setTestMode(res.data.test_mode_active);
+    } catch (err) {
+      alert("Failed to toggle Presentation Mode.");
+    }
+  };
+
+  const handleAcademicReset = async () => {
+    if (window.confirm("CRITICAL: Wipe all enrollment and allocation history? This cannot be undone.")) {
+      try {
+        const res = await api.post('/accounts/profile/reset/');
+        alert(res.data.message);
+        fetchSystemData();
+      } catch (err) { alert("Reset failed."); }
+    }
+  };
+
+  return (
+    <div style={{ backgroundColor: '#f8f9fa', minHeight: '100vh' }}>
+      <Navbar bg="dark" variant="dark" className="px-4 shadow-sm mb-4">
+        <Navbar.Brand className="fw-bold">SPU Master Command Center</Navbar.Brand>
+        <Navbar.Collapse className="justify-content-end">
+          <Badge bg={testMode ? "warning" : "success"} className="me-3">
+            {testMode ? "JURY MODE ACTIVE" : "STRICT SPU ACCESS"}
+          </Badge>
+          <Button variant="outline-danger" size="sm" onClick={() => { localStorage.removeItem('user'); navigate('/login'); }}>Logout</Button>
+        </Navbar.Collapse>
+      </Navbar>
+
+      <Container className="bg-white p-4 rounded shadow-sm mb-5">
+        <Tabs activeKey={key} onSelect={(k) => setKey(k)} className="mb-4" fill>
+          <Tab eventKey="roster" title="Roster Sync"><RosterManager activeTab={key} /></Tab>
+          <Tab eventKey="halls" title="Hall Grids"><HallsManager activeTab={key} /></Tab>
+          <Tab eventKey="exams" title="Sessions"><ExamsManager activeTab={key} /></Tab>
+          <Tab eventKey="allocations" title="Seating Maps"><AllocationManager activeTab={key} /></Tab>
+          
+          <Tab eventKey="tools" title="Master Tools">
+            <div className="p-4 border rounded bg-white shadow-sm mb-4">
+              <div className="d-flex justify-content-between align-items-center mb-4 border-bottom pb-2">
+                <h4 className="text-primary fw-bold mb-0">Identity & Privilege Manager</h4>
+                <div className="text-end">
+                  <small className="text-muted d-block">Current System Master:</small>
+                  <Badge bg="dark" className="px-3 py-2">{masterInfo.master_email}</Badge>
+                </div>
+              </div>
+
+              <Card className="bg-light border-0 mb-4 shadow-sm p-3">
+                  <h6 className="fw-bold mb-3">Pre-Authorize Admin Account</h6>
+                  <Form onSubmit={handleAddUser}>
+                    <Row className="g-3">
+                      <Col lg={6}>
+                        <Form.Control 
+                          placeholder="Admin Email Address" 
+                          value={newUser.email} 
+                          onChange={e => setNewUser({...newUser, email: e.target.value})} 
+                          required 
+                          disabled={!masterInfo.is_current_user_master}
+                        />
+                      </Col>
+                      <Col lg={3}>
+                        <Form.Select 
+                          value={newUser.role} 
+                          onChange={e => setNewUser({...newUser, role: e.target.value})} 
+                          disabled={!masterInfo.is_current_user_master}
+                        >
+                          <option value="admin">Admin / Proctor</option>
+                        </Form.Select>
+                      </Col>
+                      <Col lg={3}>
+                        <Button variant="primary" type="submit" className="w-100 fw-bold" disabled={!masterInfo.is_current_user_master || actionLoading}>
+                          {actionLoading ? "..." : "Create Admin Identity"}
+                        </Button>
+                      </Col>
+                    </Row>
+                  </Form>
+              </Card>
+
+              <div className="table-responsive">
+                <Table hover className="border-top">
+                  <thead className="bg-light text-muted small text-uppercase">
+                    <tr>
+                      <th>Email Identity</th>
+                      <th>Role</th>
+                      <th className="text-center">Admin Commands</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allUsers.filter(user => user.role === 'admin').map(user => (
+                      <tr key={user.id} className="align-middle">
+                        <td className="fw-bold text-break">{user.email}</td>
+                        <td>
+                          <Badge bg={user.role === 'admin' ? 'primary' : 'secondary'}>
+                            {user.role.toUpperCase()}
+                          </Badge>
+                        </td>
+                        <td className="text-center">
+                          {user.id === masterInfo.current_user_id ? (
+                              <Badge bg="success" className="px-3 py-2">YOU (OWNER)</Badge>
+                          ) : (
+                            <div className="d-flex flex-column flex-md-row gap-1 justify-content-center">
+                              {masterInfo.is_current_user_master ? (
+                                <>
+                                  {!user.is_superuser && (
+                                    <>
+                                      <Button variant="outline-primary" size="sm" onClick={() => {
+                                          setTargetUser(user);
+                                          setSelectedPerms(user.permissions_json || []);
+                                          setShowPermsModal(true);
+                                      }}>Perms</Button>
+                                      <Button variant="outline-warning" size="sm" onClick={() => handleMakeMaster(user.id)}>Master</Button>
+                                    </>
+                                  )}
+                                  <Button variant="danger" size="sm" onClick={() => handleKick(user.id)}>Purge</Button>
+                                </>
+                              ) : (
+                                <Badge bg="secondary">Restricted</Badge>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+              </div>
+            </div>
+
+            <Row className="g-4">
+              <Col md={6}>
+                <Card className="shadow-sm border-0 h-100 p-3">
+                  <h5 className="fw-bold text-primary">Presentation Mode</h5>
+                  <p className="text-muted small">Allow registration from non-SPU domains during the defense.</p>
+                  <Form.Check type="switch" label={testMode ? "JURY MODE ACTIVE" : "STRICT DOMAIN LOCK"} checked={testMode} onChange={toggleTestMode} className="fs-5 mt-2" />
+                </Card>
+              </Col>
+              <Col md={6}>
+                <Card className="shadow-sm border-danger border-opacity-25 h-100 p-3">
+                  <h5 className="fw-bold text-danger">Cycle Reset</h5>
+                  <p className="text-muted small">Permanently clear enrollments and seating data for the next semester.</p>
+                  <Button variant="outline-danger" className="fw-bold mt-2" onClick={handleAcademicReset}>Execute Semester Wipe</Button>
+                </Card>
+              </Col>
+            </Row>
+          </Tab>
+        </Tabs>
+      </Container>
+
+      {/* PERMISSIONS MODAL */}
+      <Modal show={showPermsModal} onHide={() => setShowPermsModal(false)} centered>
+          <Modal.Header closeButton className="bg-primary text-white">
+              <Modal.Title className="fs-5">Privilege Mapping: {targetUser?.email}</Modal.Title>
+          </Modal.Header>
+          <Modal.Body>
+              {targetUser?.is_superuser ? (
+                  <Alert variant="success" className="fw-bold">
+                    This account is a Master Admin. All modules are unlocked inherently.
+                  </Alert>
+              ) : (
+                  <>
+                    <p className="text-muted small mb-3">Check the modules this admin is authorized to manage:</p>
+                    {PERMISSION_KEYS.map(p => (
+                        <Form.Check 
+                            key={p.key}
+                            type="checkbox"
+                            label={p.label}
+                            checked={selectedPerms.includes(p.key)}
+                            onChange={(e) => {
+                                const newPerms = e.target.checked 
+                                  ? [...selectedPerms, p.key] 
+                                  : selectedPerms.filter(k => k !== p.key);
+                                setSelectedPerms(newPerms);
+                            }}
+                            className="mb-2 fw-bold"
+                        />
+                    ))}
+                  </>
+              )}
+          </Modal.Body>
+          <Modal.Footer>
+              <Button variant="primary" className="w-100 fw-bold" onClick={savePermissions} disabled={targetUser?.is_superuser}>
+                Synchronize Permissions
+              </Button>
+          </Modal.Footer>
+      </Modal>
+    </div>
+  );
+};
+
+export default AdminDashboard;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/AllocationManager.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Table, Button, Spinner, Badge, Modal } from 'react-bootstrap';
+import api from '../../services/api';
+import HallVisualizer from './HallVisualizer';
+
+const AllocationManager = ({ activeTab }) => {
+    const [exams, setExams] = useState([]);
+    const [loading, setLoading] = useState(null);
+    const [showModal, setShowModal] = useState(false);
+    const [selectedExamId, setSelectedExamId] = useState(null);
+
+    useEffect(() => { 
+        if (!activeTab || activeTab === 'allocations') {
+            fetchData(); 
+        }
+    }, [activeTab]);
+
+    const fetchData = async () => { 
+        try {
+            const res = await api.get('/seating/exams/');
+            setExams(res.data); 
+        } catch (err) {
+            console.error("Error loading allocation data:", err);
+        }
+    };
+
+    const runAllocation = async (examId) => {
+        setLoading(examId);
+        try {
+            await api.post(`/algorithm/run/${examId}/`);
+            fetchData();
+        } catch (err) { 
+            alert(err.response?.data?.error || "Allocation engine error");
+        } finally { 
+            setLoading(null);
+        }
+    };
+
+    const openVisualAudit = (examId) => {
+        setSelectedExamId(examId);
+        setShowModal(true);
+    };
+
+    return (
+        <>
+            <div className="mb-4">
+                <h4 className="fw-bold text-primary">Exam Allocation & Autofill Optimization</h4>
+                <p className="text-muted small">Monitor seat usage and handle overflows from assigned cohorts.</p>
+            </div>
+
+            {/* Mobile Optimized: table-responsive added to allow horizontal scrolling on small screens */}
+            <div className="table-responsive">
+                <Table hover className="bg-white shadow-sm rounded border-0">
+                    <thead className="bg-light text-uppercase small fw-bold">
+                        <tr>
+                            <th>Optimization Status</th>
+                            <th>Hall</th>
+                            <th>Main Cohorts</th>
+                            <th>Seating Progress</th>
+                            <th>Zebra Engine</th>
+                            <th>Blueprint</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {exams.map(e => {
+                            const hasWaitlist = e.is_allocated && e.waiting_list_count > 0;
+                            const hasEmptySeats = e.is_allocated && e.empty_seats > 0;
+                            return (
+                                <tr key={e.id} className="align-middle">
+                                    <td>
+                                        {hasWaitlist ? (
+                                            <Badge bg="warning" text="dark" className="p-2 border border-warning shadow-sm">
+                                                ⚠️ OVERFLOW: {e.waiting_list_count} Left
+                                            </Badge>
+                                        ) : hasEmptySeats ? (
+                                            <Button 
+                                                variant="link" 
+                                                size="sm" 
+                                                className="p-0 text-decoration-none text-primary fw-bold"
+                                                onClick={() => alert("Go to '3. Exams' to add a cohort and fill these " + e.empty_seats + " seats.")}
+                                            >
+                                                + Optimize: {e.empty_seats} Empty
+                                            </Button>
+                                        ) : e.is_allocated ? (
+                                            <span className="text-muted small">Fully Optimized</span>
+                                        ) : (
+                                            <span className="text-muted small">Ready to Seat</span>
+                                        )}
+                                    </td>
+                                    <td><span className="fw-bold text-uppercase">{e.hall_name}</span></td>
+                                    <td>
+                                        {e.cohorts_list?.map((c, i) => (
+                                            <Badge key={i} bg="info" className="me-1 mb-1">
+                                                {c.department}-S{c.stage} {c.subject_name}
+                                            </Badge>
+                                        ))}
+                                    </td>
+                                    <td>
+                                        {e.is_allocated ? (
+                                            <div>
+                                                <Badge bg="success" className="mb-1 w-100">Seated: {e.allocated_count}</Badge>
+                                                
+                                                {hasWaitlist && (
+                                                    <div className="small fw-bold text-warning border-top mt-1 pt-1">
+                                                        WAITLIST: {e.waiting_list_count}
+                                                    </div>
+                                                )}
+
+                                                {hasEmptySeats ? (
+                                                    <div className="small fw-bold text-danger">
+                                                        Available: {e.empty_seats}
+                                                    </div>
+                                                ) : !hasWaitlist && (
+                                                    <div className="small text-muted italic">100% Capacity</div>
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <Badge bg="secondary">Pending</Badge>
+                                        )}
+                                    </td>
+                                    <td>
+                                        <Button 
+                                            size="sm" 
+                                            variant={e.is_allocated ? "outline-warning" : "primary"}
+                                            onClick={() => runAllocation(e.id)} 
+                                            disabled={loading === e.id}
+                                            className="w-100"
+                                        >
+                                            {loading === e.id ? (
+                                                <Spinner size="sm" animation="border" />
+                                            ) : (
+                                                e.is_allocated ? "Re-Run Trio-Zebra" : "Run Algorithm"
+                                            )}
+                                        </Button>
+                                    </td>
+                                    <td>
+                                        {e.is_allocated && (
+                                            <Button 
+                                                size="sm" 
+                                                variant="info" 
+                                                className="text-white w-100" 
+                                                onClick={() => openVisualAudit(e.id)}
+                                            >
+                                                View Map
+                                            </Button>
+                                        )}
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </Table>
+            </div>
+
+            {/* Mobile Optimized: fullscreen="lg-down" added for better view on Android */}
+            <Modal show={showModal} onHide={() => setShowModal(false)} size="xl" centered fullscreen="lg-down">
+                <Modal.Header closeButton className="bg-dark text-white">
+                    <Modal.Title className="fs-6">Seating Audit Map</Modal.Title>
+                </Modal.Header>
+                <Modal.Body className="bg-light p-3">
+                    <HallVisualizer examId={selectedExamId} />
+                </Modal.Body>
+                <Modal.Footer className="border-0">
+                    <Button variant="secondary" onClick={() => setShowModal(false)} className="px-4">
+                        Close Audit
+                    </Button>
+                </Modal.Footer>
+            </Modal>
+        </>
+    );
+};
+
+export default AllocationManager;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/ExamsManager.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Table, Button, Form, Row, Col, Card, Badge } from 'react-bootstrap';
+import api from '../../services/api';
+
+const ExamsManager = ({ activeTab }) => {
+    const [exams, setExams] = useState([]);
+    const [halls, setHalls] = useState([]);
+    const [pools, setPools] = useState([]);
+    const [selectedPools, setSelectedPools] = useState([]);
+    const [assignment, setAssignment] = useState({ 
+        hall: '', 
+        startTime: '09:00', 
+        endTime: '11:00' 
+    });
+
+    useEffect(() => { 
+        // Refetch whenever this tab is clicked
+        if (!activeTab || activeTab === 'exams') {
+            fetchData(); 
+        }
+    }, [activeTab]);
+
+    const fetchData = async () => {
+        try {
+            const [examRes, hallRes, poolRes] = await Promise.all([
+                api.get('/seating/exams/'),
+                api.get('/seating/halls/'),
+                api.get('/seating/available-cohorts/')
+            ]);
+            setExams(examRes.data);
+            setHalls(hallRes.data);
+            
+            // Sort Alphabetically by Department Name, then Stage
+            const sorted = poolRes.data.sort((a, b) => {
+                if (a.department !== b.department) return a.department.localeCompare(b.department);
+                return a.stage - b.stage;
+            });
+            setPools(sorted);
+        } catch (err) {
+            console.error("Fetch error:", err);
+        }
+    };
+
+    const togglePool = (pool) => {
+        if (selectedPools.some(p => p.id === pool.id)) {
+            setSelectedPools(selectedPools.filter(p => p.id !== pool.id));
+        } else {
+            setSelectedPools([...selectedPools, pool]);
+        }
+    };
+
+    const handleCreateAssignment = async (e) => {
+        e.preventDefault();
+        if (selectedPools.length < 1) {
+            alert("Please select at least one cohort.");
+            return;
+        }
+
+        try {
+            await api.post('/seating/exams/', {
+                title: `Room Assignment`,
+                hall: assignment.hall,
+                time_range: `${assignment.startTime} - ${assignment.endTime}`,
+                cohorts: selectedPools.map(p => ({ 
+                    department: p.department, 
+                    stage: p.stage
+                }))
+            });
+            alert("Room Map Confirmed!");
+            fetchData();
+            setSelectedPools([]);
+        } catch (err) {
+            alert("Error: " + JSON.stringify(err.response?.data || "Server Error"));
+        }
+    };
+
+    const handleDeleteExam = async (examId) => {
+        if (window.confirm("Delete this room assignment?")) {
+            try {
+                await api.delete(`/seating/exams/${examId}/`);
+                fetchData();
+            } catch (err) {
+                alert("Error deleting assignment: " + (err.response?.data?.error || err.message));
+            }
+        }
+    };
+
+    return (
+        <Row>
+            <Col md={5} className="border-end">
+                <Card className="p-4 shadow-sm border-0 bg-light">
+                    <h5 className="fw-bold mb-3 text-primary">Room Mapping Tool</h5>
+                    <p className="text-muted small mb-4">Define which groups share this physical space.</p>
+                     
+                    <Form.Group className="mb-4">
+                        <Form.Label className="fw-bold">1. Select Destination Hall</Form.Label>
+                        <Form.Select 
+                            value={assignment.hall} 
+                            onChange={e => setAssignment({ ...assignment, hall: e.target.value })} 
+                            required
+                        >
+                            <option value="">Choose Hall...</option>
+                            {halls.map(h => <option key={h.id} value={h.id}>{h.name} (Cap: {h.capacity})</option>)}
+                        </Form.Select>
+                    </Form.Group>
+
+                    <Form.Group className="mb-4 mt-2">
+                        <Form.Label className="fw-bold">2. Select Time Slot</Form.Label>
+                        <div className="d-flex gap-2">
+                            <Form.Control 
+                                type="time"
+                                value={assignment.startTime} 
+                                onChange={e => setAssignment({ ...assignment, startTime: e.target.value })} 
+                                required
+                            />
+                            <span className="align-self-center fw-bold text-muted">to</span>
+                            <Form.Control 
+                                type="time"
+                                value={assignment.endTime} 
+                                onChange={e => setAssignment({ ...assignment, endTime: e.target.value })} 
+                                required
+                            />
+                        </div>
+                    </Form.Group>
+
+                    <Form.Label className="fw-bold">3. Select Cohorts (By Stage)</Form.Label>
+                    <div className="d-flex flex-wrap gap-2 mb-4">
+                        {pools.map(pool => {
+                            const isSelected = selectedPools.some(p => p.id === pool.id);
+                            const seated = Number(pool.seated_count || 0);
+                            const total = Number(pool.pool_size || 0);
+
+                            const isFull = seated >= total && total > 0;
+                            const isWaitlist = seated > 0 && seated < total;
+                            const isAvailable = seated === 0;
+
+                            let bgColor = '#6c757d'; 
+                            let textColor = 'white';
+
+                            if (isFull) {
+                                bgColor = isSelected ? '#dc3545' : 'rgba(220, 53, 69, 0.4)';
+                            } else if (isWaitlist) {
+                                bgColor = isSelected ? '#ffc107' : 'rgba(255, 193, 7, 0.5)';
+                                textColor = isSelected ? 'black' : 'white';
+                            } else if (isAvailable && isSelected) {
+                                bgColor = '#0d6efd';
+                            }
+
+                            return (
+                                <Badge 
+                                    key={pool.id}
+                                    className="p-2 border"
+                                    bg={null} 
+                                    style={{ 
+                                        cursor: 'pointer', 
+                                        backgroundColor: bgColor,
+                                        color: textColor,
+                                        borderColor: isSelected ? 'white' : 'transparent',
+                                        transition: 'all 0.2s'
+                                    }}
+                                    onClick={() => togglePool(pool)}
+                                >
+                                    {pool.department} - Stage {pool.stage} ({seated}/{total})
+                                </Badge>
+                            );
+                        })}
+                    </div>
+
+                    <Button 
+                        variant="primary" 
+                        className="w-100 fw-bold" 
+                        onClick={handleCreateAssignment}
+                        disabled={selectedPools.length < 1 || !assignment.hall}
+                    >
+                        Confirm Room Map
+                    </Button>
+                </Card>
+            </Col>
+
+            <Col md={7}>
+                <h5 className="fw-bold mb-3 px-2">Active Room Maps</h5>
+                <Table hover responsive className="bg-white rounded shadow-sm border-0">
+                    <thead className="bg-light text-uppercase small">
+                        <tr><th>Hall</th><th>Cohorts</th><th>Time Slot</th><th>Action</th></tr>
+                    </thead>
+                    <tbody>
+                        {exams.map(e => (
+                            <tr key={e.id} className="align-middle">
+                                <td className="fw-bold">{e.hall_name}</td>
+                                <td>
+                                    {e.cohorts_list?.map((c, i) => (
+                                        <Badge key={i} bg="info" className="me-1 mb-1">
+                                            {c.department} - Stage {c.stage}
+                                        </Badge>
+                                    ))}
+                                </td>
+                                <td className="fw-bold text-muted">{e.time_range}</td>
+                                <td>
+                                    <Button 
+                                        variant="outline-danger" 
+                                        size="sm" 
+                                        onClick={() => handleDeleteExam(e.id)}
+                                    >
+                                        Delete
+                                    </Button>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </Table>
+            </Col>
+        </Row>
+    );
+};
+
+export default ExamsManager;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/HallsManager.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Button, Form, Row, Col, Card, Badge, ButtonGroup, Spinner } from 'react-bootstrap';
+import api from '../../services/api';
+
+const HallsManager = () => {
+  const [halls, setHalls] = useState([]);
+  const [selectedHall, setSelectedHall] = useState(null);
+  const [newHallName, setNewHallName] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    fetchHalls();
+  }, []);
+
+  const fetchHalls = async () => {
+    try {
+      const res = await api.get('/seating/halls/');
+      setHalls(res.data);
+    } catch (err) {
+      console.error("Failed to fetch halls");
+    }
+  };
+
+  const createHall = async () => {
+    if (!newHallName) return;
+    try {
+      await api.post('/seating/halls/', { name: newHallName, rows: 5, cols: 5 });
+      setNewHallName('');
+      fetchHalls();
+    } catch (err) {
+      alert("Error creating hall");
+    }
+  };
+
+  // LOCAL UPDATE: Toggles cell between seat and path without calling the API
+  const handleCellClick = (r, c) => {
+    if (!selectedHall) return;
+    // Create a deep copy of the grid to safely update React state
+    const newGrid = [...selectedHall.seating_grid.map(row => [...row])];
+    newGrid[r][c] = newGrid[r][c] === 'seat' ? 'path' : 'seat';
+    
+    setSelectedHall({ ...selectedHall, seating_grid: newGrid });
+  };
+
+  // LOCAL UPDATE: Adds/Removes rows and columns locally
+  const modifyGrid = (action) => {
+    if (!selectedHall) return;
+    let newGrid = [...selectedHall.seating_grid.map(row => [...row])];
+    let rows = selectedHall.rows;
+    let cols = selectedHall.cols;
+
+    if (action === 'add_row') {
+      newGrid.push(Array(cols).fill('seat'));
+      // Defaults new rows to Blue
+      rows += 1;
+    } else if (action === 'remove_row' && rows > 1) {
+      newGrid.pop();
+      rows -= 1;
+    } else if (action === 'add_col') {
+      newGrid = newGrid.map(row => [...row, 'seat']);
+      // Defaults new cols to Blue
+      cols += 1;
+    } else if (action === 'remove_col' && cols > 1) {
+      newGrid = newGrid.map(row => {
+        const newRow = [...row];
+        newRow.pop();
+        return newRow;
+      });
+      cols -= 1;
+    }
+
+    setSelectedHall({ ...selectedHall, seating_grid: newGrid, rows, cols });
+  };
+
+  // THE NEW SAVE BUTTON: Sends the finished grid to the backend all at once
+  const saveLayout = async () => {
+    setIsSaving(true);
+    try {
+      const res = await api.put(`/seating/halls/${selectedHall.id}/`, {
+        action: 'save_layout',
+        grid: selectedHall.seating_grid,
+        rows: selectedHall.rows,
+        cols: selectedHall.cols
+      });
+      setSelectedHall(res.data);
+      fetchHalls(); // Sync the sidebar capacities
+      alert("Layout successfully saved!");
+    } catch (err) {
+      alert("Save failed");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const deleteHall = async (id) => {
+    if (window.confirm("Delete this hall permanently?")) {
+      await api.delete(`/seating/halls/${id}/`);
+      if (selectedHall?.id === id) setSelectedHall(null);
+      fetchHalls();
+    }
+  };
+
+  return (
+    <div className="p-2">
+      <Row>
+        {/* Hall List Sidebar */}
+        <Col md={3}>
+          <Card className="shadow-sm border-0 mb-4">
+            <Card.Body>
+              <h6 className="fw-bold mb-3">Add New Hall</h6>
+              <div className="d-flex gap-2 mb-4">
+                <Form.Control 
+                  size="sm" 
+                  placeholder="Hall Name" 
+                  value={newHallName}
+                  onChange={(e) => setNewHallName(e.target.value)}
+                />
+                <Button size="sm" onClick={createHall}>Add</Button>
+              </div>
+              <h6 className="fw-bold mb-2">Available Halls</h6>
+              {halls.map(h => (
+                <div 
+                  key={h.id} 
+                  className={`p-2 mb-2 rounded border d-flex justify-content-between align-items-center ${selectedHall?.id === h.id ? 'bg-primary text-white' : 'bg-light'}`}
+                >
+                  <div 
+                    className="flex-grow-1" 
+                    onClick={() => setSelectedHall(h)} 
+                    style={{ cursor: 'pointer' }}
+                  >
+                    <span className="small fw-bold">{h.name}</span>
+                    <Badge bg={selectedHall?.id === h.id ? 'light' : 'secondary'} text={selectedHall?.id === h.id ? 'dark' : 'white'} className="ms-2">
+                      {h.rows}x{h.cols}
+                    </Badge>
+                  </div>
+                  
+                  {/* Quick Delete Button */}
+                  <Button 
+                    variant="outline-danger" 
+                    size="sm" 
+                    className="py-0 px-2 border-0" 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteHall(h.id);
+                    }}
+                  >
+                    X
+                  </Button>
+                </div>
+              ))}
+            </Card.Body>
+          </Card>
+         </Col>
+
+        {/* Hall Grid Carver - Optimized for Mobile */}
+        <Col md={9}>
+          {selectedHall ? (
+            <Card className="shadow-sm border-0">
+              <Card.Header className="bg-white d-flex justify-content-between align-items-center py-3">
+                <h5 className="mb-0 fw-bold text-dark">Layout Carver: {selectedHall.name}</h5>
+                <div className="d-flex gap-2">
+                   <ButtonGroup size="sm">
+                      <Button variant="outline-dark" onClick={() => modifyGrid('add_row')}>+ Row</Button>
+                      <Button variant="outline-dark" onClick={() => modifyGrid('remove_row')}>- Row</Button>
+                   </ButtonGroup>
+                   <ButtonGroup size="sm">
+                      <Button variant="outline-dark" onClick={() => modifyGrid('add_col')}>+ Col</Button>
+                      <Button variant="outline-dark" onClick={() => modifyGrid('remove_col')}>- Col</Button>
+                   </ButtonGroup>
+                   <Button variant="danger" size="sm" onClick={() => deleteHall(selectedHall.id)}>Delete Hall</Button>
+                </div>
+               </Card.Header>
+              
+              <Card.Body className="text-center overflow-auto p-0" style={{ backgroundColor: '#e9ecef' }}>
+                <p className="text-muted small my-3 px-3">Tap a cell to toggle between a <span className="text-primary fw-bold">Seat</span> and a <span className="text-secondary">Path</span>.</p>
+                <div className="d-inline-block p-4 bg-white shadow-sm mb-4" style={{ minWidth: 'fit-content', borderRadius: '12px' }}>
+                  {selectedHall.seating_grid?.map((row, r) => (
+                    <div key={r} className="d-flex justify-content-center">
+                      {row.map((cell, c) => (
+                        <div
+                          key={`${r}-${c}`}
+                          onClick={() => handleCellClick(r, c)}
+                          style={{
+                            width: '42px', // Larger touch target for mobile
+                            height: '42px',
+                            margin: '4px',
+                            cursor: 'pointer',
+                            borderRadius: '6px',
+                            transition: 'all 0.2s',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '11px',
+                            fontWeight: 'bold',
+                            backgroundColor: cell === 'seat' ? '#0d6efd' : '#dee2e6',
+                            color: cell === 'seat' ? 'white' : '#6c757d',
+                            border: cell === 'seat' ? '1px solid #0a58ca' : '1px solid #ced4da'
+                          }}
+                        >
+                          {cell === 'seat' ? 'S' : ''}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </Card.Body>
+
+              {/* NEW FOOTER WITH SAVE BUTTON */}
+              <Card.Footer className="bg-white py-3 d-flex justify-content-between align-items-center">
+                <span className="text-muted small fw-bold">Grid Dimension: {selectedHall.rows} Rows x {selectedHall.cols} Columns</span>
+                <Button variant="success" className="fw-bold px-4 shadow-sm" onClick={saveLayout} disabled={isSaving}>
+                  {isSaving ? <Spinner size="sm" animation="border" /> : "Save Layout"}
+                </Button>
+              </Card.Footer>
+
+            </Card>
+          ) : (
+             <div className="text-center p-5 bg-light rounded border border-dashed">
+              <h5 className="text-muted">Select a hall from the left to edit its layout.</h5>
+            </div>
+          )}
+        </Col>
+      </Row>
+    </div>
+  );
+};
+
+export default HallsManager;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/HallVisualizer.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Card, Badge, Row, Col, Spinner, ListGroup, Alert, Modal, Button } from 'react-bootstrap';
+import api from '../../services/api';
+
+const HallVisualizer = ({ examId, highlightSeatId = null }) => {
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+
+    // UI state for the interactive features
+    const [colorMap, setColorMap] = useState({});
+    const [selectedStudent, setSelectedStudent] = useState(null);
+    const [showStudentModal, setShowStudentModal] = useState(false);
+    const [modalColor, setModalColor] = useState('#0d6efd');
+
+    const PALETTE = [
+        '#0d6efd', '#198754', '#6f42c1', '#fd7e14', 
+        '#d63384', '#20c997', '#e83e8c', '#6610f2', 
+        '#0dcaf0', '#ffc107', '#198754', '#052c65'
+    ];
+
+    useEffect(() => {
+        if (examId) fetchVisualData();
+    }, [examId]);
+
+    const fetchVisualData = async () => {
+        try {
+            const res = await api.get(`/seating/exams/${examId}/visual-audit/`);
+            const fetchedData = res.data;
+            
+            // Generate a color map for every unique cohort in the room
+            const allocations = fetchedData.allocations || [];
+            const uniqueCohorts = [...new Set(allocations.map(a => `${a.department}-${a.stage}-${a.subject}`))];
+            
+            const newColorMap = {};
+            uniqueCohorts.forEach((cohort, idx) => {
+                newColorMap[cohort] = PALETTE[idx % PALETTE.length];
+            });
+
+            setColorMap(newColorMap);
+            setData(fetchedData);
+        } catch (err) {
+            setError('Could not load the hall map.');
+            console.error(err);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // Helper to format departments as requested: IT, DB, NET
+    const getShortDept = (dept) => {
+        if (!dept) return "";
+        const d = dept.toUpperCase();
+        if (d === 'DATABASE') return 'DB';
+        if (d === 'NETWORK') return 'NET';
+        return d;
+    };
+
+    const handleSeatClick = (student, seat, color) => {
+        if (student) {
+            setSelectedStudent({ 
+                ...student, 
+                seat_label: `R${seat.row_index + 1}-C${seat.col_index + 1}` 
+            });
+            setModalColor(color);
+            setShowStudentModal(true);
+        }
+    };
+
+    if (loading) return <div className="text-center p-5"><Spinner animation="border" variant="primary" /></div>;
+    if (error) return <Alert variant="danger">{error}</Alert>;
+    if (!data) return <Alert variant="info">No seating data available for this session.</Alert>;
+
+    const hasCrossovers = data.crossovers && data.crossovers.length > 0;
+
+    return (
+        <Row className="g-4">
+            <Col lg={highlightSeatId ? 12 : 9}>
+                
+                {/* 1. CROSSOVER WARNINGS */}
+                {hasCrossovers && !highlightSeatId && (
+                    <Alert variant="warning" className="shadow-sm border-warning fw-bold mb-4">
+                        ⚠️ CROSSOVER ALERT: These students are taking multiple subjects in this room:
+                        <ul className="mb-0 mt-2 fw-normal">
+                            {data.crossovers.map((c, i) => (
+                                <li key={i}><strong>{c.email}</strong> is taking <em>{c.subjects}</em></li>
+                            ))}
+                        </ul>
+                    </Alert>
+                )}
+
+                <Card className="p-3 shadow-sm border-0 bg-white">
+                    <div className="text-center w-100 p-2 mb-3 text-muted fw-bold border-bottom bg-light rounded-top">
+                        FRONT / BOARD AREA
+                    </div>
+
+                    <div 
+                        style={{ 
+                            display: 'grid', 
+                            gridTemplateColumns: `repeat(${data.hall_cols || 5}, minmax(70px, 1fr))`,
+                            gap: '12px',
+                            justifyContent: 'center'
+                        }}
+                    >
+                        {(data.seats || []).map(seat => {
+                            const student = (data.allocations || []).find(a => a.seat_id === seat.id);
+                            const isMySeat = highlightSeatId === seat.id;
+                            const isSpace = seat.seat_type === 'space';
+                            
+                            let bgColor = '#ffffff';
+                            let textColor = '#6c757d';
+                            let cursorStyle = 'default';
+                            
+                            if (isSpace) {
+                                bgColor = 'transparent';
+                                textColor = 'transparent';
+                            } else if (!seat.is_active) {
+                                bgColor = '#e9ecef';
+                            } else if (isMySeat) {
+                                bgColor = '#0d6efd';
+                                textColor = '#ffffff';
+                            } else if (student) {
+                                // CRITICAL FIX: Prioritize RED for retakes
+                                if (student.is_retake) {
+                                    bgColor = '#dc3545';
+                                } else {
+                                    const cohortKey = `${student.department}-${student.stage}-${student.subject}`;
+                                    bgColor = colorMap[cohortKey] || '#198754';
+                                }
+                                textColor = '#ffffff';
+                                cursorStyle = 'pointer';
+                            }
+
+                            return (
+                                <div 
+                                    key={seat.id}
+                                    onClick={() => !isSpace && handleSeatClick(student, seat, bgColor)}
+                                    className={`position-relative d-flex flex-column align-items-center justify-content-center rounded p-2 
+                                        ${isMySeat ? 'pulse-highlight' : ''} 
+                                        ${student ? 'shadow-sm hover-lift' : ''}`}
+                                    style={{ 
+                                        minHeight: '80px', 
+                                        transition: 'all 0.2s',
+                                        backgroundColor: bgColor,
+                                        color: textColor,
+                                        border: isSpace ? 'none' : (isMySeat ? '3px solid #ffd700' : '1px solid #dee2e6'),
+                                        cursor: cursorStyle,
+                                        visibility: isSpace ? 'hidden' : 'visible'
+                                    }}
+                                >
+                                    {!isSpace && (
+                                        <>
+                                            {/* Department Label: CAPITAL and BOLD */}
+                                            <span className="fw-bold mb-1" style={{ fontSize: '11px', textTransform: 'uppercase' }}>
+                                                {student ? getShortDept(student.department) : `${seat.row_index + 1}-${seat.col_index + 1}`}
+                                            </span>
+                                            <div className="text-truncate w-100 text-center fw-bold text-uppercase" style={{ fontSize: '14px' }}>
+                                                {student ? student.student_name : !seat.is_active ? 'BROKEN' : 'EMPTY'}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* Legend */}
+                    <div className="mt-4 pt-3 border-top d-flex flex-wrap justify-content-center gap-3 small text-muted fw-bold">
+                        {Object.entries(colorMap).map(([cohort, color]) => (
+                            <div key={cohort} className="d-flex align-items-center">
+                                <div className="rounded me-2 shadow-sm" style={{width: 14, height: 14, backgroundColor: color}}></div> 
+                                {cohort.replace(/-/g, ' ')}
+                            </div>
+                        ))}
+                        <div className="d-flex align-items-center"><div className="bg-danger rounded-circle me-2 shadow-sm" style={{width:10, height:10}}></div> Retake</div>
+                        <div className="d-flex align-items-center"><div className="bg-white border rounded me-2" style={{width:14, height:14}}></div> Empty</div>
+                        <div className="d-flex align-items-center"><div className="bg-light border rounded me-2" style={{width:14, height:14}}></div> Broken</div>
+                    </div>
+                </Card>
+            </Col>
+
+            {/* Waiting List Sidebar */}
+            {!highlightSeatId && (
+                <Col lg={3}>
+                    <h6 className="fw-bold mb-3 d-flex justify-content-between align-items-center">
+                        Waiting List
+                        <Badge bg="danger" pill>{data.overflow?.length || 0}</Badge>
+                    </h6>
+                    <ListGroup variant="flush" className="shadow-sm rounded border overflow-auto" style={{ maxHeight: '600px' }}>
+                        {data.overflow && data.overflow.length > 0 ? data.overflow.map((student, idx) => (
+                                <ListGroup.Item key={idx} className="small py-2 bg-light border-bottom">
+                                    <div className="d-flex justify-content-between align-items-start mb-1">
+                                        <div className="fw-bold text-truncate">{student.email.split('@')[0]}</div>
+                                        {student.is_retake && <Badge bg="danger" style={{fontSize: '9px'}}>RETAKE</Badge>}
+                                    </div>
+                                    <div className="text-muted" style={{ fontSize: '11px' }}>
+                                        {student.department} Stage {student.stage} <br/>
+                                        <span className="text-primary fw-bold">{student.subject}</span>
+                                    </div>
+                                </ListGroup.Item>
+                            )) : (
+                                <ListGroup.Item className="text-muted small italic p-4 text-center">
+                                    All students allocated.
+                                </ListGroup.Item>
+                            )}
+                    </ListGroup>
+                </Col>
+            )}
+
+            {/* Student Detail Modal */}
+            <Modal show={showStudentModal} onHide={() => setShowStudentModal(false)} centered size="sm">
+                <Modal.Header closeButton style={{ backgroundColor: modalColor, color: 'white', border: 'none' }}>
+                    <Modal.Title className="fs-5 fw-bold">Seat {selectedStudent?.seat_label}</Modal.Title>
+                </Modal.Header>
+                
+                <Modal.Body className="text-center p-4">
+                    <div className="fw-bold fs-4 text-uppercase mb-1">{selectedStudent?.student_name}</div>
+                    {selectedStudent?.is_retake && (
+                        <div className="mb-2">
+                            <Badge bg="danger" className="px-3 py-1 shadow-sm">RETAKE STUDENT</Badge>
+                        </div>
+                    )}
+                    <div className="text-muted small mb-4">{selectedStudent?.full_email}</div>
+                    <Row className="g-2 text-start">
+                        <Col xs={6}>
+                            <div className="p-2 bg-light rounded border small">
+                                <div className="text-muted" style={{fontSize: '10px'}}>DEPARTMENT</div>
+                                <div className="fw-bold">{selectedStudent?.department}</div>
+                            </div>
+                        </Col>
+                        <Col xs={6}>
+                            <div className="p-2 bg-light rounded border small">
+                                <div className="text-muted" style={{fontSize: '10px'}}>STAGE</div>
+                                <div className="fw-bold">Stage {selectedStudent?.stage}</div>
+                            </div>
+                        </Col>
+                        <Col xs={12}>
+                            <div className="p-2 bg-light rounded border small">
+                                <div className="text-muted" style={{fontSize: '10px'}}>EXAM SUBJECT(S)</div>
+                                <div className="fw-bold text-primary">{selectedStudent?.subject}</div>
+                            </div>
+                        </Col>
+                    </Row>
+                </Modal.Body>
+                <Modal.Footer className="border-0 justify-content-center pb-4">
+                    <Button variant="outline-secondary" size="sm" onClick={() => setShowStudentModal(false)} className="w-100">
+                        Close Details
+                    </Button>
+                </Modal.Footer>
+            </Modal>
+
+            <style>{`
+                .pulse-highlight {
+                    animation: pulse-blue 2s infinite;
+                    box-shadow: 0 0 0 0 rgba(13, 110, 253, 0.7);
+                }
+                @keyframes pulse-blue {
+                    0% { transform: scale(1); }
+                    50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(13, 110, 253, 0); }
+                    100% { transform: scale(1); }
+                }
+                .hover-lift:hover {
+                    transform: translateY(-3px);
+                    box-shadow: 0 4px 8px rgba(0,0,0,0.15) !important;
+                }
+            `}</style>
+        </Row>
+    );
+};
+
+export default HallVisualizer;
+
+================================================================================
+?? FILE: frontend/src/pages/admin/RosterManager.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Form, Button, Card, Row, Col, Table, Spinner, Badge } from 'react-bootstrap';
+import api from '../../services/api';
+
+const RosterManager = () => {
+  const [students, setStudents] = useState([]);
+  const [viewCtx, setViewCtx] = useState({ department: 'IT', stage: '1' });
+  const [actionCtx, setActionCtx] = useState({ department: 'IT', stage: '1' });
+  const [file, setFile] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // State for Manual Student Entry
+  const [manualStudent, setManualStudent] = useState({ email: '', department: 'IT', stage: '1' });
+  const [manualLoading, setManualLoading] = useState(false);
+
+  // Fetch students automatically when the viewing department or stage changes
+  useEffect(() => {
+    fetchStudents();
+  }, [viewCtx.department, viewCtx.stage]);
+
+  const fetchStudents = async () => {
+    try {
+      const res = await api.get(`/accounts/profile/list/?department=${viewCtx.department}&stage=${viewCtx.stage}`);
+      setStudents(res.data);
+    } catch (err) {
+      console.error("Failed to fetch students", err);
+    }
+  };
+
+  const handleUpload = async (e) => {
+    e.preventDefault();
+    if (!file) return alert("Select an Excel or CSV file!");
+    setLoading(true);
+    
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('department', actionCtx.department); 
+    formData.append('stage', actionCtx.stage);
+
+    try {
+      await api.post('/accounts/profile/sync-roster/', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      alert("Sync Successful!");
+      setFile(null);
+      
+      // Auto-switch view to the newly uploaded cohort
+      setViewCtx({
+         department: actionCtx.department,
+         stage: actionCtx.stage
+      });
+      fetchStudents(); 
+    } catch (err) {
+      alert("Error: " + (err.response?.data?.error || "Check File format"));
+    } finally { 
+      setLoading(false); 
+    }
+  };
+
+  const handleManualAdd = async (e) => {
+    e.preventDefault();
+    if (!manualStudent.email) return alert("Please provide an email.");
+    setManualLoading(true);
+
+    try {
+      const res = await api.post('/accounts/profile/add-manual/', {
+        email: manualStudent.email.trim(),
+        department: manualStudent.department,
+        stage: manualStudent.stage
+      });
+      alert(res.data.message);
+      
+      if (viewCtx.department === manualStudent.department && viewCtx.stage === manualStudent.stage) {
+        fetchStudents();
+      }
+      setManualStudent({ ...manualStudent, email: '' }); 
+    } catch (err) {
+      alert("Error: " + (err.response?.data?.error || "Failed to add student."));
+    } finally {
+      setManualLoading(false);
+    }
+  };
+
+  const wipeView = () => {
+    const scope = `${viewCtx.department} Stage ${viewCtx.stage}`;
+    if (!window.confirm(`Surgical Wipe: Are you sure you want to delete ALL enrollments for ${scope}?`)) return;
+    
+    api.post('/accounts/profile/wipe-filtered/', viewCtx)
+      .then((res) => {
+          alert(res.data.message);
+          setStudents([]);
+          fetchStudents(); 
+      })
+      .catch(err => {
+          alert("Wipe failed: " + (err.response?.data?.error || "Connection error"));
+      });
+  };
+
+  const handleDelete = (id) => {
+    if (!window.confirm("Delete this student record?")) return;
+    api.post('/accounts/profile/bulk-delete/', { mode: 'single', id: id })
+       .then(() => { fetchStudents(); });
+  };
+
+  const handleWipeAll = () => {
+    if (!window.confirm("CRITICAL WARNING: Wipe the entire student database?")) return;
+    api.post('/accounts/profile/bulk-delete/', { mode: 'all' })
+       .then(() => { fetchStudents(); });
+  };
+
+  return (
+    <Card className="p-4 border-0 shadow-sm mt-3">
+      <div className="d-flex justify-content-between mb-4">
+        <h4 className="text-success fw-bold">Student Database</h4>
+        <div className="d-flex gap-2">
+            <Button variant="warning" size="sm" onClick={wipeView}>Wipe View</Button>
+            <Button variant="danger" size="sm" onClick={handleWipeAll}>Wipe All</Button>
+        </div>
+      </div>
+
+      <h6 className="fw-bold text-muted small mb-2">BULK DATA SYNC (EXCEL/CSV)</h6>
+      <Form onSubmit={handleUpload} className="bg-light p-3 mb-4 rounded border">
+        <Row className="g-2 align-items-center">
+          <Col md={3}>
+            <Form.Select value={actionCtx.department} onChange={e => setActionCtx({...actionCtx, department: e.target.value})}>
+              <option value="IT">IT</option>
+              <option value="NETWORK">NETWORK</option>
+              <option value="DATABASE">DATABASE</option>
+            </Form.Select>
+          </Col>
+          <Col md={3}>
+            <Form.Select value={actionCtx.stage} onChange={e => setActionCtx({...actionCtx, stage: e.target.value})}>
+              {[1, 2, 3, 4].map(s => <option key={s} value={s}>Stage {s}</option>)}
+            </Form.Select>
+          </Col>
+          <Col md={4}>
+            <Form.Control type="file" accept=".csv, .xlsx, .xls" onChange={e => setFile(e.target.files[0])} required />
+          </Col>
+          <Col md={2}>
+            <Button variant="success" type="submit" className="w-100 fw-bold" disabled={loading}>
+              {loading ? <Spinner size="sm" animation="border" /> : "Sync File"}
+            </Button>
+          </Col>
+        </Row>
+      </Form>
+
+      <h6 className="fw-bold text-muted small mb-2">MANUAL STUDENT ENTRY</h6>
+      <Form onSubmit={handleManualAdd} className="bg-light p-3 mb-4 rounded border border-primary border-opacity-25">
+        <Row className="g-2 align-items-center">
+          <Col md={4}>
+            <Form.Control 
+              placeholder="Student Email Address" 
+              value={manualStudent.email}
+              onChange={e => setManualStudent({...manualStudent, email: e.target.value})}
+              required 
+            />
+          </Col>
+          <Col md={3}>
+            <Form.Select value={manualStudent.department} onChange={e => setManualStudent({...manualStudent, department: e.target.value})}>
+              <option value="IT">IT</option>
+              <option value="NETWORK">NETWORK</option>
+              <option value="DATABASE">DATABASE</option>
+            </Form.Select>
+          </Col>
+          <Col md={3}>
+            <Form.Select value={manualStudent.stage} onChange={e => setManualStudent({...manualStudent, stage: e.target.value})}>
+              {[1, 2, 3, 4].map(s => <option key={s} value={s}>Stage {s}</option>)}
+            </Form.Select>
+          </Col>
+          <Col md={2}>
+            <Button variant="primary" type="submit" className="w-100 fw-bold" disabled={manualLoading}>
+              {manualLoading ? <Spinner size="sm" animation="border" /> : "Add Student"}
+            </Button>
+          </Col>
+        </Row>
+      </Form>
+
+      <div className="mb-3 d-flex gap-2 align-items-center bg-light p-2 rounded border">
+        <span className="fw-bold small text-muted px-2">VIEWING:</span>
+        <Form.Select size="sm" style={{width:'150px'}} value={viewCtx.department} onChange={e => setViewCtx({...viewCtx, department: e.target.value})}>
+          <option value="IT">IT</option>
+          <option value="NETWORK">NETWORK</option>
+          <option value="DATABASE">DATABASE</option>
+        </Form.Select>
+        <Form.Select size="sm" style={{width:'150px'}} value={viewCtx.stage} onChange={e => setViewCtx({...viewCtx, stage: e.target.value})}>
+          {[1, 2, 3, 4].map(s => <option key={s} value={s}>Stage {s}</option>)}
+        </Form.Select>
+      </div>
+      
+      <div className="table-responsive">
+        <Table bordered hover size="sm" className="mb-0 bg-white shadow-sm">
+          <thead className="table-dark">
+            <tr>
+              <th className="text-center" style={{ width: '50px' }}>#</th>
+              <th>Email</th>
+              <th className="text-center">Status</th>
+              <th className="text-center" style={{ width: '80px' }}>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {students.length > 0 ? students.map((s, index) => (
+              <tr key={s.id} className="align-middle">
+                <td className="text-center fw-bold text-muted">{index + 1}</td>
+                <td className="fw-bold px-3 text-dark" style={{ fontSize: '0.95rem' }}>{s.email}</td>
+                <td className="text-center">
+                  {s.is_retake ? (
+                    <Badge bg="danger" className="p-2 shadow-sm">Retake Detected</Badge>
+                  ) : (
+                    <Badge bg="success" className="p-2 shadow-sm">Regular</Badge>
+                  )}
+                </td>
+                <td className="text-center">
+                  <Button variant="link" className="text-danger p-0 fw-bold" onClick={() => handleDelete(s.id)}>Delete</Button>
+                </td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan="4" className="text-center p-4 text-muted fst-italic">
+                  No students found in this cohort. Upload a file or use manual entry to add students.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </Table>
+      </div>
+    </Card>
+  );
+};
+
+export default RosterManager;
+
+================================================================================
+?? FILE: frontend/src/pages/student/StudentDashboard.jsx
+--------------------------------------------------------------------------------
+import { useState, useEffect } from 'react';
+import { Container, Card, Alert, Spinner, Row, Col, Form, Button, Navbar, Modal, Badge } from 'react-bootstrap';
+import { useNavigate } from 'react-router-dom';
+import api from '../../services/api';
+
+const StudentDashboard = () => {
+  // Safer initialization: Read user from localStorage to prevent blank screen crashes
+  const [user, setUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('user');
+      return saved ? JSON.parse(saved) : null;
+    } catch (err) {
+      return null;
+    }
+  });
+
+  const [allocations, setAllocations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [showMap, setShowMap] = useState(false);
+  const [selectedAlloc, setSelectedAlloc] = useState(null);
+  const navigate = useNavigate();
+
+  const [department, setDepartment] = useState('');
+  const [stage, setStage] = useState('');
+  const [updatingProfile, setUpdatingProfile] = useState(false);
+
+  useEffect(() => {
+    if (!user) {
+      navigate('/login');
+      return;
+    }
+
+    /** * READ-ONLY LOGIC:
+     * If the admin has already set the department and stage (via CSV sync),
+     * we skip the confirmation form even if profile_confirmed is false.
+     */
+    if (user.profile_confirmed || (user.department && user.stage)) {
+      fetchMySeats();
+    } else {
+      setLoading(false);
+    }
+  }, [user, navigate]);
+
+  const fetchMySeats = async () => {
+    try {
+      const res = await api.get('/seating/my-seats/');
+      // Ensure we always handle the response as an array
+      setAllocations(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      setError('Failed to fetch your assigned seats.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleProfileSubmit = async (e) => {
+    e.preventDefault();
+    setUpdatingProfile(true); 
+    setError('');
+
+    try {
+      await api.put('/accounts/profile/update/', { 
+        department: department.trim(), 
+        stage: parseInt(stage) 
+      });
+
+      // Update local state and storage after successful backend update
+      const updatedUser = { ...user, profile_confirmed: true, department, stage };
+      localStorage.setItem('user', JSON.stringify(updatedUser));
+      setUser(updatedUser);
+      fetchMySeats();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to update profile.');
+    } finally {
+      setUpdatingProfile(false);
+    }
+  };
+
+  const openVisualMap = (alloc) => {
+    setSelectedAlloc(alloc);
+    setShowMap(true);
+  };
+
+  if (loading) {
+    return (
+      <div className="d-flex justify-content-center align-items-center" style={{ height: '100vh' }}>
+        <Spinner animation="border" variant="primary" />
+      </div>
+    );
+  }
+
+  // Only show the setup form if the info is completely missing from the admin sync
+  const needsSetup = !user?.profile_confirmed && (!user?.department || !user?.stage);
+
+  return (
+    <div style={{ backgroundColor: '#f4f6f9', minHeight: '100vh' }}>
+      <Navbar bg="primary" variant="dark" className="px-4 shadow-sm mb-4">
+        <Navbar.Brand className="fw-bold">SPU Student Portal</Navbar.Brand>
+        <Button variant="outline-light" size="sm" onClick={() => { localStorage.removeItem('user'); navigate('/login'); }}>Logout</Button>
+      </Navbar>
+
+      <Container>
+        {error && <Alert variant="danger" className="text-center py-2 small">{error}</Alert>}
+
+        {needsSetup ? (
+          <Card className="p-4 shadow-sm mx-auto" style={{ maxWidth: '500px', borderRadius: '15px', border: 'none' }}>
+            <h4 className="text-center text-primary fw-bold mb-4">Complete Your Profile</h4>
+            <p className="text-muted small text-center mb-4">Your academic details are missing. Please provide them to see your seat.</p>
+            <Form onSubmit={handleProfileSubmit}>
+              <Form.Group className="mb-3">
+                <Form.Label className="small fw-bold text-muted">DEPARTMENT</Form.Label>
+                <Form.Control 
+                  placeholder="e.g., IT" 
+                  value={department} 
+                  onChange={(e) => setDepartment(e.target.value)} 
+                  required 
+                />
+              </Form.Group>
+              <Form.Group className="mb-4">
+                <Form.Label className="small fw-bold text-muted">STAGE</Form.Label>
+                <Form.Select value={stage} onChange={(e) => setStage(e.target.value)} required>
+                  <option value="">Select Stage...</option>
+                  {[1, 2, 3, 4].map(s => <option key={s} value={s}>Stage {s}</option>)}
+                </Form.Select>
+              </Form.Group>
+              <Button variant="primary" type="submit" className="w-100 fw-bold py-2 shadow-sm" disabled={updatingProfile}>
+                {updatingProfile ? <Spinner size="sm" /> : "Confirm Details"}
+              </Button>
+            </Form>
+          </Card>
+        ) : (
+          <div>
+            <div className="text-center mb-4">
+              <h4 className="fw-bold text-dark mb-1">Your Exam Schedule</h4>
+              {/* READ-ONLY Identity Badges */}
+              <div className="d-flex justify-content-center gap-2 mt-2">
+                <Badge bg="primary" className="px-3 py-2 shadow-sm text-uppercase">{user.department}</Badge>
+                <Badge bg="dark" className="px-3 py-2 shadow-sm">Stage {user.stage}</Badge>
+              </div>
+              <small className="text-muted d-block mt-2">{user.email}</small>
+            </div>
+
+            <Row className="g-3">
+              {allocations.length > 0 ? allocations.map(alloc => (
+                <Col md={6} lg={4} key={alloc.id}>
+                  <Card className="shadow-sm border-0 border-top border-primary border-3 h-100">
+                    <Card.Body>
+                      <Card.Title className="fw-bold text-primary mb-3 text-truncate">{alloc.exam_details.title}</Card.Title>
+                      <hr className="my-2 opacity-10" />
+                      <Row className="mb-3 align-items-center">
+                        <Col xs={7}>
+                          <small className="text-muted d-block text-uppercase" style={{ fontSize: '10px' }}>Location / Hall</small>
+                          <div className="fw-bold fs-5 text-dark">{alloc.exam_details.hall_name}</div>
+                        </Col>
+                        <Col xs={5} className="text-end">
+                          <small className="text-muted d-block text-uppercase mb-1" style={{ fontSize: '10px' }}>Assigned Seat</small>
+                          <Badge bg="success" className="fs-6 px-3 py-2 shadow-sm">
+                            R{alloc.seat_details.row_index} - C{alloc.seat_details.col_index}
+                          </Badge>
+                        </Col>
+                      </Row>
+                      <div className="mb-4 bg-light p-3 rounded border">
+                        <small className="text-muted d-block text-uppercase mb-1" style={{ fontSize: '10px' }}>Time & Date</small>
+                        <div className="fw-bold text-dark">{alloc.exam_details.date} at <span className="text-primary">{alloc.exam_details.start_time}</span></div>
+                      </div>
+                      <Button 
+                        variant="outline-primary" 
+                        className="w-100 fw-bold border-2 shadow-sm py-2"
+                        onClick={() => openVisualMap(alloc)}
+                      >
+                        View My Seat on Hall Map
+                      </Button>
+                    </Card.Body>
+                  </Card>
+                </Col>
+              )) : (
+                <Col xs={12}>
+                  <Alert variant="info" className="text-center py-5 border-0 shadow-sm bg-white">
+                    <div className="fs-5 mb-2">No seat allocations found.</div>
+                    <div className="small text-muted">Please check back once the administration runs the seating algorithm.</div>
+                  </Alert>
+                </Col>
+              )}
+            </Row>
+          </div>
+        )}
+      </Container>
+
+      {/* Hall Map Modal - Exactly matching the Admin Visual Audit Map Style with layout carving */}
+      <Modal show={showMap} onHide={() => setShowMap(false)} size="lg" centered fullscreen="md-down">
+        <Modal.Header closeButton className="bg-dark text-white border-0">
+          <Modal.Title className="fw-bold fs-5">Location: {selectedAlloc?.exam_details.hall_name}</Modal.Title>
+        </Modal.Header>
+        
+        <Modal.Body className="bg-light p-3">
+          <div className="border rounded bg-white shadow-sm mx-auto overflow-auto" style={{ width: '100%', maxHeight: '65vh' }}>
+            <div className="text-center w-100 p-2 text-muted fw-bold border-bottom bg-light sticky-top" style={{ fontSize: '12px', zIndex: 10 }}>
+              FRONT / BOARD AREA
+            </div>
+            
+            <div className="p-3">
+              {selectedAlloc && (() => {
+                const seatingGrid = selectedAlloc.exam_details.seating_grid;
+                const cols = selectedAlloc.exam_details.hall_cols || 5;
+                
+                // Backend sends 1-based index (e.g. Row 1). We need 0-based to match the array index.
+                const myR = selectedAlloc.seat_details.row_index - 1;
+                const myC = selectedAlloc.seat_details.col_index - 1;
+
+                if (!seatingGrid || seatingGrid.length === 0) {
+                  return <Alert variant="warning" className="text-center mt-3">Missing seating grid layout data from backend.</Alert>;
+                }
+
+                return (
+                  <div 
+                    style={{ 
+                      display: 'grid', 
+                      gridTemplateColumns: `repeat(${cols}, minmax(50px, 1fr))`,
+                      gap: '10px',
+                      justifyContent: 'center'
+                    }}
+                  >
+                    {seatingGrid.map((row, r) => 
+                      row.map((cell, c) => {
+                        const isMySeat = (r === myR && c === myC);
+                        const isSpace = cell === 'path';
+
+                        return (
+                          <div 
+                            key={`${r}-${c}`}
+                            className={`position-relative d-flex flex-column align-items-center justify-content-center rounded p-1 ${isMySeat ? 'pulse-highlight shadow-sm' : ''}`}
+                            style={{
+                              minHeight: '70px',
+                              backgroundColor: isSpace ? 'transparent' : (isMySeat ? '#0d6efd' : '#f8f9fa'),
+                              color: isSpace ? 'transparent' : (isMySeat ? 'white' : '#adb5bd'),
+                              border: isSpace ? 'none' : (isMySeat ? '3px solid #ffd700' : '1px solid #e9ecef'),
+                              visibility: isSpace ? 'hidden' : 'visible',
+                              transition: 'all 0.3s ease'
+                            }}
+                          >
+                            {!isSpace && (
+                              <>
+                                {isMySeat ? (
+                                  <>
+                                    <span className="fw-bold mb-1" style={{ fontSize: '10px', textTransform: 'uppercase' }}>YOU</span>
+                                    <div className="fw-bold text-uppercase" style={{ fontSize: '14px' }}>R{r + 1}-C{c + 1}</div>
+                                  </>
+                                ) : (
+                                  <span className="fw-bold" style={{ fontSize: '11px' }}>{r + 1}-{c + 1}</span>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+          
+          <div className="text-center text-muted small fst-italic mt-3 px-3">
+            Note: This map is oriented toward the front of the hall. Other students are hidden for privacy.
+          </div>
+        </Modal.Body>
+        
+        <Modal.Footer className="border-0 justify-content-center bg-light">
+            <Button variant="secondary" onClick={() => setShowMap(false)} className="px-5 fw-bold shadow-sm">Close Map</Button>
+        </Modal.Footer>
+      </Modal>
+
+      {/* Synchronized Pulse Animation from HallVisualizer */}
+      <style>{`
+        .pulse-highlight {
+          animation: pulse-blue 2s infinite;
+          box-shadow: 0 0 0 0 rgba(13, 110, 253, 0.7);
+        }
+        @keyframes pulse-blue {
+          0% { transform: scale(1); }
+          50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(13, 110, 253, 0); }
+          100% { transform: scale(1); }
+        }
+        .card { transition: transform 0.2s ease-in-out; }
+        .card:hover { transform: translateY(-3px); }
+      `}</style>
+    </div>
+  );
+};
+
+export default StudentDashboard;
